@@ -16,7 +16,7 @@ COPY src ./src
 COPY docs ./docs
 COPY scripts ./scripts
 COPY migrations ./migrations
-COPY profiles.json ./profiles.json
+COPY profile.example.json ./profile.example.json
 COPY sessions.example.json ./sessions.example.json
 
 RUN pip install --upgrade pip \

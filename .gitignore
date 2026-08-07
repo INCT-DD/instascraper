@@ -10,6 +10,7 @@ cookies.txt
 sessions.json
 sessions.local.json
 cookies/
+profiles.json
 
 # Runtime output
 collector.db

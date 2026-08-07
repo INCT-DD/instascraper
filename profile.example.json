@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Perfil Exemplo 1",
+    "username": "perfilpublico1",
+    "active": true,
+    "notes": "Exemplo de perfil publico monitorado para pesquisa academica.",
+    "priority": 10
+  },
+  {
+    "name": "Perfil Exemplo 2",
+    "username": "perfilpublico2",
+    "active": true,
+    "notes": "Copie este arquivo para profiles.json e substitua pelos perfis reais.",
+    "priority": 8
+  }
+]
