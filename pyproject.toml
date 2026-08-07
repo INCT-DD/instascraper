@@ -13,6 +13,7 @@ dependencies = [
     "requests>=2.31",
     "psycopg[binary]>=3.2",
     "gallery-dl>=1.27",
+    "tzdata>=2025.2",
 ]
 
 [project.scripts]

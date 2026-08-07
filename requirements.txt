@@ -3,4 +3,5 @@ httpx[http2]
 requests
 psycopg[binary]
 gallery-dl
+tzdata
 
