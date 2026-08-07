@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+.deps/
+
+# Local credentials and sessions
+.env
+cookie.json
+cookies.txt
+sessions.json
+sessions.local.json
+cookies/
+
+# Runtime output
+collector.db
+data/
+logs/
+reports/
+exports/
+output/

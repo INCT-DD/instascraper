@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-c", "import time; time.sleep(10**9)"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      TIMEZONE: ${TIMEZONE:-America/Bahia}
+      RPS: ${RPS:-1}
+      MARGIN_DAYS: ${MARGIN_DAYS:-0}
+      COLLECT_COMMENTS_DEFAULT: ${COLLECT_COMMENTS_DEFAULT:-true}
+      COLLECT_REPLIES_DEFAULT: ${COLLECT_REPLIES_DEFAULT:-true}
+      MAX_JOB_ATTEMPTS: ${MAX_JOB_ATTEMPTS:-3}
+      JOB_LIMIT_PER_RUN: ${JOB_LIMIT_PER_RUN:-100}
+      MAX_COMMENTS_PER_POST: ${MAX_COMMENTS_PER_POST:-500}
+      COMMENT_QUEUE_TIME_LIMIT_SECONDS: ${COMMENT_QUEUE_TIME_LIMIT_SECONDS:-1800}
+      ACCOUNT_ROTATION_ENABLED: ${ACCOUNT_ROTATION_ENABLED:-false}
+      GALLERY_DL_ENABLED: ${GALLERY_DL_ENABLED:-true}
+      GALLERY_DL_BINARY: ${GALLERY_DL_BINARY:-gallery-dl}
+      GALLERY_DL_SLEEP_REQUEST: ${GALLERY_DL_SLEEP_REQUEST:-6.0-12.0}
+      GALLERY_DL_TIMEOUT_SECONDS: ${GALLERY_DL_TIMEOUT_SECONDS:-900}
+      COOKIE_JSON_PATH: /app/cookies/collector-01.json
+      DATA_DIR: /app/data
+      LOGS_DIR: /app/logs
+      REPORTS_DIR: /app/reports
+      EXPORTS_DIR: /app/exports
+      PROFILES_PATH: /app/profiles.json
+      SESSIONS_PATH: /app/sessions.json
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED:-false}
+      NOTIFY_PROVIDER: ${NOTIFY_PROVIDER:-telegram}
+      NOTIFY_ON_SUCCESS: ${NOTIFY_ON_SUCCESS:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
+    volumes:
+      - media_data:/app/data
+      - logs_data:/app/logs
+      - reports_data:/app/reports
+      - exports_data:/app/exports
+      - ./profiles.json:/app/profiles.json:ro
+      - ./sessions.json:/app/sessions.json:ro
+      - ./cookies:/app/cookies:ro
+volumes:
+  postgres_data:
+  exports_data:
+  logs_data:
+  reports_data:
+  media_data:

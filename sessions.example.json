@@ -1,0 +1,16 @@
+[
+  {
+    "name": "collector-01",
+    "active": true,
+    "instagram_cookie_json": "cookies/collector-01.json",
+    "gallery_dl_cookies": "cookies/collector-01.txt",
+    "notes": "Use paths only; never commit cookie contents."
+  },
+  {
+    "name": "collector-02",
+    "active": false,
+    "instagram_cookie_json": "cookies/collector-02.json",
+    "gallery_dl_cookies": "cookies/collector-02.txt",
+    "notes": "Enable only for authorized research accounts."
+  }
+]

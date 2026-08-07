@@ -1,0 +1,16 @@
+.git
+.agents
+.codex
+.venv
+.deps
+__pycache__
+*.pyc
+.env
+collector.db
+data
+exports
+logs
+reports
+output
+cookies
+sessions.json
