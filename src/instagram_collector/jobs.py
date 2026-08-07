@@ -7,10 +7,15 @@ from typing import Any, Dict, Optional
 
 from instagram_scraper import AuthError, ScrapeError, parse_comment_node
 
-from .config import Settings
+from .config import Settings, load_sessions
 from .files import write_profile_comments
 from .scraper import InstagramCollector
+from .sessions import CollectorSession, SessionPool
 from .storage import Database
+
+
+JOB_TYPE_COMMENTS = "comments"
+JOB_TYPE_REPLIES = "replies"
 
 
 @dataclass
@@ -22,10 +27,20 @@ class JobStats:
 
 
 class JobProcessor:
-    def __init__(self, db: Database, settings: Settings, rps: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        settings: Settings,
+        rps: Optional[float] = None,
+        session_pool: Optional[SessionPool] = None,
+    ) -> None:
         self.db = db
         self.settings = settings
         self.rps = rps if rps is not None else settings.rps
+        self.session_pool = session_pool or SessionPool(
+            load_sessions(settings),
+            settings.account_rotation_enabled,
+        )
 
     async def process_pending_jobs(self, limit: Optional[int] = None) -> JobStats:
         job_limit = limit if limit is not None else self.settings.job_limit_per_run
@@ -36,30 +51,50 @@ class JobProcessor:
             print("No pending jobs.")
             return stats
 
-        async with InstagramCollector(self.settings.cookie_json_path, self.rps) as scraper:
-            for job in jobs:
-                if self._time_limit_reached(started_at):
-                    print("Comment queue time limit reached; remaining jobs stay pending.")
-                    break
-                self.db.mark_job_started(job["id"])
-                try:
-                    if job["job_type"] == "comments":
-                        counts = await self._process_comment_job(scraper, job)
-                    elif job["job_type"] == "replies":
-                        counts = await self._process_reply_job(scraper, job)
-                    else:
-                        raise ValueError(f"Unknown job_type: {job['job_type']}")
-                    self.db.mark_job_success(job["id"])
-                    stats.processed += 1
-                    stats.comments_inserted += counts.get("comments_inserted", 0)
-                    stats.replies_inserted += counts.get("replies_inserted", 0)
-                    print(f"Job {job['id']} done: {job['job_type']}")
-                except (AuthError, ScrapeError, Exception) as exc:
-                    self.db.mark_job_failed(job["id"], str(exc))
-                    stats.failed += 1
-                    print(f"Job {job['id']} failed: {exc}")
+        for job in jobs:
+            if self._time_limit_reached(started_at):
+                print("Comment queue time limit reached; remaining jobs stay pending.")
+                break
+            self.db.mark_job_started(job["id"])
+            try:
+                counts = await self._process_job_with_sessions(job)
+                self.db.mark_job_success(job["id"])
+                stats.processed += 1
+                stats.comments_inserted += counts.get("comments_inserted", 0)
+                stats.replies_inserted += counts.get("replies_inserted", 0)
+                print(f"Job {job['id']} done: {job['job_type']}")
+            except (AuthError, ScrapeError, Exception) as exc:
+                self.db.mark_job_failed(job["id"], str(exc))
+                stats.failed += 1
+                print(f"Job {job['id']} failed: {exc}")
 
         return stats
+
+    async def _process_job_with_sessions(self, job: Dict[str, Any]) -> Dict[str, int]:
+        session = self.session_pool.next()
+        failures = []
+        for candidate in [session, *self.session_pool.alternatives(session)]:
+            try:
+                counts = await self._process_job_with_session(candidate, job)
+                return counts
+            except (AuthError, ScrapeError) as exc:
+                failures.append(f"{candidate.alias}: {exc}")
+
+        if failures:
+            raise ScrapeError("All configured sessions failed for job: " + " ; ".join(failures))
+        raise RuntimeError("No collector session could process the job.")
+
+    async def _process_job_with_session(
+        self,
+        session: CollectorSession,
+        job: Dict[str, Any],
+    ) -> Dict[str, int]:
+        async with InstagramCollector(session.instagram_cookie_json, self.rps) as scraper:
+            if job["job_type"] == JOB_TYPE_COMMENTS:
+                return await self._process_comment_job(scraper, job)
+            if job["job_type"] == JOB_TYPE_REPLIES:
+                return await self._process_reply_job(scraper, job)
+            raise ValueError(f"Unknown job_type: {job['job_type']}")
 
     async def _process_comment_job(
         self,
@@ -95,7 +130,7 @@ class JobProcessor:
                 cursor = self._reply_cursor(comment)
                 if self._has_reply_payload(comment):
                     self.db.enqueue_job(
-                        "replies",
+                        JOB_TYPE_REPLIES,
                         profile_id=post["profile_id"],
                         post_id=post["id"],
                         comment_id=comment_id,
