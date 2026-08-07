@@ -237,7 +237,7 @@ Durante a paginacao:
 
 - posts mais novos que o fim do periodo sao ignorados;
 - posts dentro do periodo sao normalizados e persistidos;
-- posts anteriores ao inicio do periodo sao ignorados;
+- posts mais antigos que o inicio do periodo sao ignorados;
 - quando a pagina inteira ja esta antes do inicio do periodo, a coleta para aquele perfil pode ser encerrada, evitando buscar paginas antigas desnecessariamente.
 
 Esse comportamento explica por que um perfil pode retornar zero posts em um dia especifico: se nao houve publicacao dentro da janela calculada, nada sera persistido, mesmo que o perfil tenha posts antes ou depois da data.
