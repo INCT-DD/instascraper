@@ -9,9 +9,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from instagram_scraper import AuthError, ScrapeError
 
 from .config import Settings, load_profiles, load_sessions
-from .files import ensure_runtime_dirs, write_daily_report, write_profile_posts
+from .files import ensure_runtime_dirs, write_candidate_archive, write_daily_report, write_profile_posts
 from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor, JobStats
+from .media_jobs import JOB_TYPE_POST_MEDIA, JOB_TYPE_STORIES
+from .post_media import download_post_media
 from .scraper import InstagramCollector
 from .sessions import CollectorSession, SessionPool
 from .storage import Database
@@ -24,6 +26,10 @@ class ProfileCollectionStats:
     posts_updated: int = 0
     jobs_enqueued: int = 0
     stories_found: int = 0
+    media_attempted: int = 0
+    media_downloaded: int = 0
+    media_failed: int = 0
+    media_jobs_enqueued: int = 0
     errors: int = 0
 
 
@@ -104,6 +110,11 @@ def _new_daily_report(
         "posts_inserted": 0,
         "posts_updated": 0,
         "stories_found": 0,
+        "post_media_attempted": 0,
+        "post_media_downloaded": 0,
+        "post_media_failed": 0,
+        "media_jobs_enqueued": 0,
+        "story_jobs_enqueued": 0,
         "comment_jobs_enqueued": 0,
         "comments_inserted": 0,
         "replies_inserted": 0,
@@ -122,6 +133,11 @@ def _new_profile_result(username: str, session_alias: Optional[str]) -> Dict[str
         "posts_inserted": 0,
         "posts_updated": 0,
         "stories_found": 0,
+        "post_media_attempted": 0,
+        "post_media_downloaded": 0,
+        "post_media_failed": 0,
+        "media_jobs_enqueued": 0,
+        "story_jobs_enqueued": 0,
         "comment_jobs_enqueued": 0,
         "session_alias": session_alias,
         "story_session_alias": None,
@@ -138,10 +154,18 @@ def _apply_post_stats(
     profile_result["posts_inserted"] = stats.posts_inserted
     profile_result["posts_updated"] = stats.posts_updated
     profile_result["comment_jobs_enqueued"] = stats.jobs_enqueued
+    profile_result["post_media_attempted"] = stats.media_attempted
+    profile_result["post_media_downloaded"] = stats.media_downloaded
+    profile_result["post_media_failed"] = stats.media_failed
+    profile_result["media_jobs_enqueued"] = stats.media_jobs_enqueued
     report["posts_found"] += stats.posts_found
     report["posts_inserted"] += stats.posts_inserted
     report["posts_updated"] += stats.posts_updated
     report["comment_jobs_enqueued"] += stats.jobs_enqueued
+    report["post_media_attempted"] += stats.media_attempted
+    report["post_media_downloaded"] += stats.media_downloaded
+    report["post_media_failed"] += stats.media_failed
+    report["media_jobs_enqueued"] += stats.media_jobs_enqueued
 
 
 def _apply_profile_status(
@@ -158,6 +182,8 @@ def _apply_profile_status(
     if (
         profile_result["posts_found"] == 0
         and profile_result["stories_found"] == 0
+        and int(profile_result.get("media_jobs_enqueued", 0)) == 0
+        and int(profile_result.get("story_jobs_enqueued", 0)) == 0
         and (collect_posts_enabled or collect_stories_enabled)
     ):
         profile_result["status"] = "empty_for_day"
@@ -199,6 +225,8 @@ async def _collect_profile_posts_with_sessions(
     session: CollectorSession,
     sessions: SessionPool,
     output_date: date,
+    archive_date_from: date,
+    archive_date_to: date,
 ) -> PostCollectionAttempt:
     last_error: Optional[Exception] = None
     errors = []
@@ -214,6 +242,8 @@ async def _collect_profile_posts_with_sessions(
                 rps=rps,
                 session=candidate,
                 output_date=output_date,
+                archive_date_from=archive_date_from,
+                archive_date_to=archive_date_to,
             )
             return PostCollectionAttempt(stats=stats, session_alias=candidate.alias, errors=errors)
         except Exception as exc:
@@ -236,7 +266,12 @@ def _collect_profile_stories(
     profile_result: Dict[str, Any],
 ) -> None:
     story_sessions = [session, *sessions.alternatives(session)]
-    story_result = story_collector.collect_profile_stories(profile["username"], target_date, story_sessions)
+    story_result = story_collector.collect_profile_stories(
+        profile["username"],
+        target_date,
+        story_sessions,
+        candidate_name=str(profile.get("name") or profile["username"]),
+    )
     profile_result["stories_found"] = story_result.files_found
     profile_result["story_session_alias"] = story_result.session_alias
     report["stories_found"] += story_result.files_found
@@ -248,6 +283,27 @@ def _collect_profile_stories(
                 profile_result["stories_saved"] = int(profile_result.get("stories_saved", 0)) + 1
     if story_result.status == "failed":
         profile_result["errors"].append(story_result.error_message)
+
+
+def _enqueue_story_collection_job(
+    db: Database,
+    settings: Settings,
+    profile: Dict[str, Any],
+    target_date: date,
+    report: Dict[str, Any],
+    profile_result: Dict[str, Any],
+) -> None:
+    job_id = db.enqueue_job(
+        JOB_TYPE_STORIES,
+        profile_id=profile["id"],
+        cursor=target_date.isoformat(),
+        priority=int(profile.get("priority", 0)) + 100,
+        max_attempts=settings.max_job_attempts,
+    )
+    if job_id:
+        profile_result["story_jobs_enqueued"] = int(profile_result.get("story_jobs_enqueued", 0)) + 1
+        report["story_jobs_enqueued"] += 1
+    profile_result["story_session_alias"] = "media-worker"
 
 
 def _pending_jobs_count(db: Database) -> int:
@@ -319,6 +375,8 @@ async def collect_profile(
     rps: Optional[float] = None,
     session: Optional[CollectorSession] = None,
     output_date: Optional[date] = None,
+    archive_date_from: Optional[date] = None,
+    archive_date_to: Optional[date] = None,
 ) -> ProfileCollectionStats:
     profile = db.get_profile_by_username(username)
     if not profile:
@@ -334,12 +392,52 @@ async def collect_profile(
         async with InstagramCollector(cookie_path, rps or settings.rps) as scraper:
             posts = await scraper.fetch_profile_posts(username, date_from, date_to)
 
+        if settings.collect_post_media and posts and not settings.media_queue_enabled:
+            media_stats = await download_post_media(
+                posts,
+                settings.post_media_dir,
+                output_date or date_to.date(),
+                str(profile.get("name") or username),
+                settings.post_media_timeout_seconds,
+            )
+            stats.media_attempted = media_stats.attempted
+            stats.media_downloaded = media_stats.downloaded
+            stats.media_failed = media_stats.failed
+
         write_profile_posts(settings.data_dir, output_date or date_to.date(), username, posts)
+        write_candidate_archive(
+            settings.candidate_archive_dir,
+            str(profile.get("name") or username),
+            username,
+            archive_date_from or date_from.date(),
+            archive_date_to or date_to.date(),
+            posts,
+        )
         stats.posts_found = len(posts)
         last_seen_post_at = None
         for post in posts:
             post_id, inserted, comments_changed = db.upsert_post(profile["id"], post)
             db.store_raw_payload("post", post_id, profile["id"], post.get("raw_json", post))
+            media_count = 0
+            for media in post.get("media_assets") or []:
+                if isinstance(media, dict):
+                    media_count += 1
+                    if settings.collect_post_media and settings.media_queue_enabled:
+                        media.setdefault("download_status", "pending")
+                    db.upsert_post_media(post_id, media)
+            if settings.collect_post_media and settings.media_queue_enabled and media_count:
+                pending_media = db.list_post_media_for_post(post_id, only_pending=True)
+                stats.media_attempted += len(pending_media)
+                job_id = db.enqueue_job(
+                    JOB_TYPE_POST_MEDIA,
+                    profile_id=profile["id"],
+                    post_id=post_id,
+                    shortcode=post["shortcode"],
+                    priority=int(profile.get("priority", 0)),
+                    max_attempts=settings.max_job_attempts,
+                ) if pending_media else None
+                if job_id:
+                    stats.media_jobs_enqueued += 1
             if inserted:
                 stats.posts_inserted += 1
             else:
@@ -377,7 +475,7 @@ async def collect_profile(
         print(
             f"@{username}: {stats.posts_found} found, "
             f"{stats.posts_inserted} inserted, {stats.posts_updated} updated, "
-            f"{stats.jobs_enqueued} comment jobs."
+            f"{stats.jobs_enqueued} comment jobs, {stats.media_jobs_enqueued} media jobs."
         )
         return stats
     except (AuthError, ScrapeError, Exception) as exc:
@@ -395,6 +493,7 @@ async def run_daily_collection(
     process_jobs: bool = True,
     collect_posts_enabled: bool = True,
     collect_stories_enabled: bool = True,
+    retry_incomplete: bool = False,
 ) -> Dict[str, Any]:
     started_at = datetime.now(tz=timezone.utc)
     ensure_runtime_dirs(settings.data_dir, settings.logs_dir, settings.reports_dir, settings.exports_dir)
@@ -404,12 +503,17 @@ async def run_daily_collection(
         margin_days if margin_days is not None else settings.margin_days,
         settings.timezone,
     )
+    profiles = (
+        db.list_incomplete_profiles_for_daily(date_from, date_to)
+        if retry_incomplete
+        else db.list_active_profiles()
+    )
     daily_run_id = db.start_run(None, "daily", date_from, date_to)
-    profiles = db.list_active_profiles()
     sessions = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
     story_collector = GalleryDlStoryCollector(settings)
     report = _new_daily_report(target_date, started_at, date_from, date_to, settings.timezone, len(profiles))
-    print(f"Starting daily collection for {len(profiles)} profiles.")
+    mode = "incomplete profiles" if retry_incomplete else "profiles"
+    print(f"Starting daily collection for {len(profiles)} {mode}.")
 
     for profile in profiles:
         session = sessions.next()
@@ -422,11 +526,13 @@ async def run_daily_collection(
                     profile["username"],
                     date_from,
                     date_to,
-                    enqueue_comments=True,
+                    enqueue_comments=settings.collect_comments_default,
                     rps=rps,
                     session=session,
                     sessions=sessions,
                     output_date=target_date,
+                    archive_date_from=target_date,
+                    archive_date_to=target_date,
                 )
                 profile_result["errors"].extend(attempt.errors)
                 if attempt.session_alias:
@@ -438,16 +544,19 @@ async def run_daily_collection(
                     _apply_post_stats(report, profile_result, attempt.stats)
 
             if collect_stories_enabled:
-                _collect_profile_stories(
-                    db,
-                    story_collector,
-                    profile,
-                    target_date,
-                    session,
-                    sessions,
-                    report,
-                    profile_result,
-                )
+                if settings.media_queue_enabled:
+                    _enqueue_story_collection_job(db, settings, profile, target_date, report, profile_result)
+                else:
+                    _collect_profile_stories(
+                        db,
+                        story_collector,
+                        profile,
+                        target_date,
+                        session,
+                        sessions,
+                        report,
+                        profile_result,
+                    )
 
             _apply_profile_status(report, profile_result, collect_posts_enabled, collect_stories_enabled)
         except Exception as exc:
@@ -458,7 +567,7 @@ async def run_daily_collection(
         _record_profile_result(db, daily_run_id, profile, profile_result)
         report["profile_results"].append(profile_result)
 
-    if not process_jobs:
+    if not process_jobs or not settings.collect_comments_default:
         return _finish_daily_run(db, settings, daily_run_id, target_date, started_at, report)
 
     await _process_daily_jobs(db, settings, rps, report)
@@ -478,6 +587,7 @@ async def collect_posts_period(
     sessions = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
     profiles = [db.get_profile_by_username(username.lstrip("@"))] if username else db.list_active_profiles()
     results = []
+    enqueue_comments = enqueue_comments and settings.collect_comments_default
     for profile in [item for item in profiles if item]:
         session = sessions.next()
         attempt = await _collect_profile_posts_with_sessions(
@@ -491,6 +601,8 @@ async def collect_posts_period(
             session=session,
             sessions=sessions,
             output_date=date_to.date(),
+            archive_date_from=date_from.date(),
+            archive_date_to=date_to.date(),
         )
         if attempt.stats is None:
             results.append(

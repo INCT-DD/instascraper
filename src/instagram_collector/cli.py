@@ -3,16 +3,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import date
+from pathlib import Path
+import shutil
 from typing import Optional
 
 from .config import load_sessions, load_settings, parse_iso_date
 from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor
 from .logging_setup import configure_logging
+from .media_jobs import MediaJobProcessor
 from .notifications import build_crash_report, send_report_notification
 from .pipeline import collect_posts_period, export_collected_day, explicit_window, run_daily_collection, seed_profiles
 from .sessions import SessionPool
 from .storage import Database
+
+
+def _collection_modes(args: argparse.Namespace, settings) -> tuple[bool, bool]:
+    if args.posts_only and args.stories_only:
+        raise ValueError("--posts-only and --stories-only cannot be used together.")
+    if args.posts_only:
+        return True, False
+    if args.stories_only:
+        return False, True
+    return settings.collect_posts_default, settings.collect_stories_default
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--skip-jobs", action="store_true", help="Only collect posts and enqueue jobs.")
     daily.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     daily.add_argument("--stories-only", action="store_true", help="Skip post collection.")
+    daily.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
 
     scheduled = sub.add_parser("run-scheduled", help="Run daily collection, export optionally, and notify on failures.")
     scheduled.add_argument("--date", dest="target_date", help="Target date in YYYY-MM-DD. Defaults to today.")
@@ -34,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduled.add_argument("--skip-jobs", action="store_true", help="Only collect posts/stories and enqueue jobs.")
     scheduled.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     scheduled.add_argument("--stories-only", action="store_true", help="Skip post collection.")
+    scheduled.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
     scheduled.add_argument("--export", action="store_true", help="Export collected day after the run.")
     scheduled.add_argument("--notify", action="store_true", help="Send notification even if NOTIFY_ENABLED=false.")
     scheduled.add_argument("--no-notify", action="store_true", help="Disable notification for this run.")
@@ -42,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         jobs = sub.add_parser(command_name, help="Process pending comment/reply jobs.")
         jobs.add_argument("--limit", type=int, default=None)
         jobs.add_argument("--rps", type=float, default=None)
+
+    media_jobs = sub.add_parser("process-media-queue", help="Process pending post media and story download jobs.")
+    media_jobs.add_argument("--limit", type=int, default=None)
+    media_jobs.add_argument("--watch", action="store_true", help="Keep polling for pending media jobs.")
+    media_jobs.add_argument("--sleep", type=int, default=None, help="Polling interval in seconds when --watch is used.")
 
     posts = sub.add_parser("collect-posts", help="Collect posts for a date range.")
     posts.add_argument("--start-date", required=True)
@@ -67,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("seed-profiles", help="Create/update monitored profiles and database schema.")
     sub.add_parser("init-db", help="Create/update database schema only.")
     sub.add_parser("migrate", help="Run database migrations.")
+
+    cleanup = sub.add_parser("cleanup-secondary-data", help="Remove optional comments/stories data after confirmation.")
+    cleanup.add_argument("--comments", action="store_true", help="Remove comments, replies and comment jobs.")
+    cleanup.add_argument("--stories", action="store_true", help="Remove story rows and story raw payloads.")
+    cleanup.add_argument("--story-media-files", action="store_true", help="Also remove data/raw/stories files.")
+    cleanup.add_argument("--confirm", action="store_true", help="Actually delete data. Without this flag only prints counts.")
     return parser
 
 
@@ -87,6 +113,34 @@ async def _run_async(args: argparse.Namespace) -> None:
             print("Database schema is migrated.")
             return
 
+        if args.command == "cleanup-secondary-data":
+            db.init_schema()
+            if not args.comments and not args.stories and not args.story_media_files:
+                raise ValueError("Choose at least one cleanup target: --comments, --stories or --story-media-files.")
+            if args.comments:
+                print(
+                    "Comments cleanup target: "
+                    f"{db.count_rows('comments')} comments, {db.count_rows('replies')} replies."
+                )
+            if args.stories:
+                print(f"Stories cleanup target: {db.count_rows('stories')} story rows.")
+            story_dir = Path(settings.data_dir) / "raw" / "stories"
+            if args.story_media_files:
+                print(f"Story media cleanup target: {story_dir}")
+            if not args.confirm:
+                print("Dry run only. Re-run with --confirm to delete.")
+                return
+            if args.comments:
+                deleted = db.cleanup_comments_data()
+                print(f"Deleted comments data: {deleted}")
+            if args.stories:
+                deleted = db.cleanup_stories_data()
+                print(f"Deleted stories data: {deleted}")
+            if args.story_media_files and story_dir.exists():
+                shutil.rmtree(story_dir)
+                print(f"Deleted story media files: {story_dir}")
+            return
+
         if args.command == "seed-profiles":
             seed_profiles(db, settings)
             print("Monitored profiles seeded.")
@@ -96,6 +150,7 @@ async def _run_async(args: argparse.Namespace) -> None:
 
         if args.command == "run-daily":
             target_date = parse_iso_date(args.target_date)
+            collect_posts_enabled, collect_stories_enabled = _collection_modes(args, settings)
             report = await run_daily_collection(
                 db,
                 settings,
@@ -103,8 +158,9 @@ async def _run_async(args: argparse.Namespace) -> None:
                 margin_days=args.margin_days,
                 rps=args.rps,
                 process_jobs=not args.skip_jobs,
-                collect_posts_enabled=not args.stories_only,
-                collect_stories_enabled=not args.posts_only,
+                collect_posts_enabled=collect_posts_enabled,
+                collect_stories_enabled=collect_stories_enabled,
+                retry_incomplete=args.retry_incomplete,
             )
             print(
                 f"Daily run done: {report['posts_found']} posts, {report['stories_found']} story files, "
@@ -114,6 +170,7 @@ async def _run_async(args: argparse.Namespace) -> None:
 
         if args.command == "run-scheduled":
             target_date = parse_iso_date(args.target_date)
+            collect_posts_enabled, collect_stories_enabled = _collection_modes(args, settings)
             report = None
             try:
                 report = await run_daily_collection(
@@ -123,8 +180,9 @@ async def _run_async(args: argparse.Namespace) -> None:
                     margin_days=args.margin_days,
                     rps=args.rps,
                     process_jobs=not args.skip_jobs,
-                    collect_posts_enabled=not args.stories_only,
-                    collect_stories_enabled=not args.posts_only,
+                    collect_posts_enabled=collect_posts_enabled,
+                    collect_stories_enabled=collect_stories_enabled,
+                    retry_incomplete=args.retry_incomplete,
                 )
                 if args.export:
                     export_path = export_collected_day(db, settings, target_date)
@@ -153,6 +211,9 @@ async def _run_async(args: argparse.Namespace) -> None:
             return
 
         if args.command in {"process-jobs", "process-comments-queue"}:
+            if not settings.collect_comments_default:
+                print("Comment collection is disabled by COLLECT_COMMENTS_DEFAULT=false.")
+                return
             processor = JobProcessor(db, settings, rps=args.rps)
             run_id = db.start_run(None, "jobs", None, None)
             try:
@@ -170,6 +231,18 @@ async def _run_async(args: argparse.Namespace) -> None:
             except Exception as exc:
                 db.finish_run(run_id, "failed", error_message=str(exc))
                 raise
+            return
+
+        if args.command == "process-media-queue":
+            processor = MediaJobProcessor(db, settings)
+            if args.watch:
+                await processor.watch(args.limit, args.sleep)
+            else:
+                stats = await processor.process_pending_jobs(args.limit)
+                print(
+                    f"Media jobs processed: {stats.processed}; failed: {stats.failed}; "
+                    f"post media downloaded: {stats.post_media_downloaded}; stories saved: {stats.stories_saved}."
+                )
             return
 
         if args.command == "collect-posts":
@@ -203,6 +276,7 @@ async def _run_async(args: argparse.Namespace) -> None:
                     profile["username"],
                     target_date,
                     [session, *pool.alternatives(session)],
+                    candidate_name=str(profile.get("name") or profile["username"]),
                 )
                 stories_saved = 0
                 if result.output_dir:
@@ -231,7 +305,7 @@ async def _run_async(args: argparse.Namespace) -> None:
                 enqueue_comments=args.comments,
                 rps=args.rps,
             )
-            if args.comments:
+            if args.comments and settings.collect_comments_default:
                 processor = JobProcessor(db, settings, rps=args.rps)
                 await processor.process_pending_jobs(settings.job_limit_per_run)
             return

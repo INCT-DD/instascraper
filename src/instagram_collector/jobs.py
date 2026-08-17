@@ -44,7 +44,7 @@ class JobProcessor:
 
     async def process_pending_jobs(self, limit: Optional[int] = None) -> JobStats:
         job_limit = limit if limit is not None else self.settings.job_limit_per_run
-        jobs = self.db.fetch_pending_jobs(job_limit)
+        jobs = self.db.fetch_pending_jobs(job_limit, job_types=(JOB_TYPE_COMMENTS, JOB_TYPE_REPLIES))
         stats = JobStats()
         started_at = time.monotonic()
         if not jobs:

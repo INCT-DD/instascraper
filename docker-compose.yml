@@ -23,7 +23,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
+    environment: &app_environment
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -32,8 +32,16 @@ services:
       TIMEZONE: ${TIMEZONE:-America/Bahia}
       RPS: ${RPS:-1}
       MARGIN_DAYS: ${MARGIN_DAYS:-0}
-      COLLECT_COMMENTS_DEFAULT: ${COLLECT_COMMENTS_DEFAULT:-true}
-      COLLECT_REPLIES_DEFAULT: ${COLLECT_REPLIES_DEFAULT:-true}
+      COLLECT_POSTS_DEFAULT: ${COLLECT_POSTS_DEFAULT:-true}
+      COLLECT_STORIES_DEFAULT: ${COLLECT_STORIES_DEFAULT:-true}
+      COLLECT_COMMENTS_DEFAULT: ${COLLECT_COMMENTS_DEFAULT:-false}
+      COLLECT_REPLIES_DEFAULT: ${COLLECT_REPLIES_DEFAULT:-false}
+      COLLECT_POST_MEDIA: ${COLLECT_POST_MEDIA:-true}
+      MEDIA_QUEUE_ENABLED: ${MEDIA_QUEUE_ENABLED:-true}
+      MEDIA_WORKER_SLEEP_SECONDS: ${MEDIA_WORKER_SLEEP_SECONDS:-10}
+      POST_MEDIA_DIR: ${POST_MEDIA_DIR:-/app/exports/instagram}
+      STORY_MEDIA_DIR: ${STORY_MEDIA_DIR:-/app/exports/instagram}
+      POST_MEDIA_TIMEOUT_SECONDS: ${POST_MEDIA_TIMEOUT_SECONDS:-60}
       MAX_JOB_ATTEMPTS: ${MAX_JOB_ATTEMPTS:-3}
       JOB_LIMIT_PER_RUN: ${JOB_LIMIT_PER_RUN:-100}
       MAX_COMMENTS_PER_POST: ${MAX_COMMENTS_PER_POST:-500}
@@ -48,6 +56,7 @@ services:
       LOGS_DIR: /app/logs
       REPORTS_DIR: /app/reports
       EXPORTS_DIR: /app/exports
+      CANDIDATE_ARCHIVE_DIR: ${CANDIDATE_ARCHIVE_DIR:-/app/exports/instagram}
       PROFILES_PATH: /app/profiles.json
       SESSIONS_PATH: /app/sessions.json
       NOTIFY_ENABLED: ${NOTIFY_ENABLED:-false}
@@ -63,17 +72,37 @@ services:
       SMTP_TO: ${SMTP_TO:-}
       SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
       SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
-    volumes:
+    volumes: &app_volumes
       - media_data:/app/data
       - logs_data:/app/logs
       - reports_data:/app/reports
-      - exports_data:/app/exports
+      - ${HOST_EXPORTS_DIR:-./exports}:/app/exports
       - ./profiles.json:/app/profiles.json:ro
       - ./sessions.json:/app/sessions.json:ro
       - ./cookies:/app/cookies:ro
+
+  media-worker:
+    build: .
+    restart: unless-stopped
+    command:
+      [
+        "python",
+        "-m",
+        "pipeline",
+        "process-media-queue",
+        "--watch",
+        "--limit",
+        "${MEDIA_QUEUE_LIMIT:-25}",
+        "--sleep",
+        "${MEDIA_WORKER_SLEEP_SECONDS:-10}",
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *app_environment
+    volumes: *app_volumes
 volumes:
   postgres_data:
-  exports_data:
   logs_data:
   reports_data:
   media_data:
