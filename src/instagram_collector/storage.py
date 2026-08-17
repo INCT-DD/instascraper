@@ -81,6 +81,23 @@ CREATE TABLE IF NOT EXISTS posts (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS post_media (
+    id BIGSERIAL PRIMARY KEY,
+    post_id BIGINT NOT NULL REFERENCES posts(id),
+    media_index INTEGER NOT NULL,
+    media_type TEXT,
+    source_url TEXT,
+    local_path TEXT,
+    width INTEGER,
+    height INTEGER,
+    download_status TEXT,
+    error_message TEXT,
+    raw_json JSONB,
+    collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (post_id, media_index, media_type, source_url)
+);
+
 CREATE TABLE IF NOT EXISTS stories (
     id BIGSERIAL PRIMARY KEY,
     profile_id BIGINT NOT NULL REFERENCES profiles(id),
@@ -227,6 +244,23 @@ CREATE TABLE IF NOT EXISTS posts (
     raw_json TEXT,
     collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS post_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES posts(id),
+    media_index INTEGER NOT NULL,
+    media_type TEXT,
+    source_url TEXT,
+    local_path TEXT,
+    width INTEGER,
+    height INTEGER,
+    download_status TEXT,
+    error_message TEXT,
+    raw_json TEXT,
+    collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (post_id, media_index, media_type, source_url)
 );
 
 CREATE TABLE IF NOT EXISTS stories (
@@ -451,6 +485,23 @@ class Database:
             else "SELECT * FROM profiles WHERE active = TRUE ORDER BY priority DESC, username"
         )
 
+    def list_incomplete_profiles_for_daily(self, date_from: Any, date_to: Any) -> List[Dict[str, Any]]:
+        active_condition = "p.active = TRUE" if self.is_postgres else "p.active = 1"
+        sql = (
+            "SELECT p.* FROM profiles p "
+            f"WHERE {active_condition} AND NOT EXISTS ("
+            "SELECT 1 FROM profile_collection_status pcs "
+            "JOIN collection_runs cr ON cr.id = pcs.run_id "
+            "WHERE pcs.profile_id = p.id "
+            "AND cr.run_type = 'daily' "
+            f"AND cr.date_from = {self.placeholder} "
+            f"AND cr.date_to = {self.placeholder} "
+            "AND pcs.status IN ('success', 'empty_for_day')"
+            ") "
+            "ORDER BY p.priority DESC, p.username"
+        )
+        return self._fetchall(sql, (str(date_from), str(date_to)))
+
     def get_profile_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         return self._fetchone(
             f"SELECT * FROM profiles WHERE username = {self.placeholder}",
@@ -627,6 +678,123 @@ class Database:
     def get_post(self, post_id: int) -> Optional[Dict[str, Any]]:
         return self._fetchone(f"SELECT * FROM posts WHERE id = {self.placeholder}", (post_id,))
 
+    def upsert_post_media(self, post_id: int, media: Dict[str, Any]) -> Tuple[int, bool]:
+        source_url = str(media.get("url") or media.get("source_url") or "")
+        existing = self._fetchone(
+            (
+                "SELECT id, local_path, download_status, error_message FROM post_media WHERE post_id = ? AND media_index = ? "
+                "AND COALESCE(media_type, '') = COALESCE(?, '') "
+                "AND COALESCE(source_url, '') = COALESCE(?, '')"
+            ).replace("?", self.placeholder),
+            (post_id, int(media.get("index") or 1), media.get("media_type"), source_url),
+        )
+        params = (
+            post_id,
+            int(media.get("index") or 1),
+            media.get("media_type"),
+            source_url,
+            media.get("local_path"),
+            media.get("width"),
+            media.get("height"),
+            media.get("download_status"),
+            media.get("download_error"),
+            self._json_param(media),
+            self._now(),
+        )
+        if existing:
+            incoming_status = params[7]
+            existing_status = existing.get("download_status")
+            if incoming_status == "pending" and existing_status in {"success", "downloaded"}:
+                incoming_status = existing_status
+                params = (
+                    params[0],
+                    params[1],
+                    params[2],
+                    params[3],
+                    existing.get("local_path"),
+                    params[5],
+                    params[6],
+                    incoming_status,
+                    existing.get("error_message"),
+                    params[9],
+                    params[10],
+                )
+            sql = (
+                "UPDATE post_media SET local_path = ?, width = ?, height = ?, download_status = ?, "
+                "error_message = ?, raw_json = ?, updated_at = ? WHERE id = ?"
+            )
+            update_params = (
+                params[4],
+                params[5],
+                params[6],
+                params[7],
+                params[8],
+                params[9],
+                params[10],
+                existing["id"],
+            )
+            if self.is_postgres:
+                sql = sql.replace("?", "%s")
+            with closing(self.conn.cursor()) as cur:
+                cur.execute(sql, update_params)
+            self.conn.commit()
+            return int(existing["id"]), False
+
+        sql = (
+            "INSERT INTO post_media "
+            "(post_id, media_index, media_type, source_url, local_path, width, height, "
+            "download_status, error_message, raw_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        if self.is_postgres:
+            sql = sql.replace("?", "%s") + " RETURNING id"
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(sql, params)
+            media_id = cur.fetchone()["id"] if self.is_postgres else cur.lastrowid
+        self.conn.commit()
+        return int(media_id), True
+
+    def list_post_media_for_post(self, post_id: int, only_pending: bool = False) -> List[Dict[str, Any]]:
+        status_filter = ""
+        if only_pending:
+            status_filter = "AND COALESCE(download_status, '') NOT IN ('success', 'downloaded') "
+        return self._fetchall(
+            (
+                "SELECT * FROM post_media "
+                f"WHERE post_id = {self.placeholder} {status_filter}"
+                "ORDER BY media_index, id"
+            ),
+            (post_id,),
+        )
+
+    def update_post_media_download(
+        self,
+        media_id: int,
+        status: str,
+        local_path: Optional[str] = None,
+        error_message: Optional[str] = None,
+        raw_json: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sql = (
+            "UPDATE post_media SET download_status = ?, local_path = COALESCE(?, local_path), "
+            "error_message = ?, raw_json = COALESCE(?, raw_json), updated_at = ? WHERE id = ?"
+        )
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(
+                sql,
+                (
+                    status,
+                    local_path,
+                    error_message[:2000] if error_message else None,
+                    self._json_param(raw_json) if raw_json is not None else None,
+                    self._now(),
+                    media_id,
+                ),
+            )
+        self.conn.commit()
+
     def upsert_story(self, profile_id: int, story: Dict[str, Any]) -> Tuple[int, bool]:
         platform_story_id = str(
             story.get("id")
@@ -796,10 +964,12 @@ class Database:
         existing = self._fetchone(
             (
                 "SELECT id FROM collection_jobs WHERE job_type = ? AND status IN ('pending', 'retry', 'running') "
+                "AND COALESCE(profile_id, -1) = COALESCE(?, -1) "
                 "AND COALESCE(post_id, -1) = COALESCE(?, -1) "
-                "AND COALESCE(comment_id, -1) = COALESCE(?, -1)"
+                "AND COALESCE(comment_id, -1) = COALESCE(?, -1) "
+                "AND COALESCE(cursor, '') = COALESCE(?, '')"
             ).replace("?", self.placeholder),
-            (job_type, post_id, comment_id),
+            (job_type, profile_id, post_id, comment_id, cursor),
         )
         if existing:
             return None
@@ -817,19 +987,63 @@ class Database:
         self.conn.commit()
         return int(job_id)
 
-    def fetch_pending_jobs(self, limit: int) -> List[Dict[str, Any]]:
+    def fetch_pending_jobs(self, limit: int, job_types: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+        type_filter = ""
+        params: Tuple[Any, ...] = ()
+        if job_types:
+            placeholders = ", ".join([self.placeholder] * len(job_types))
+            type_filter = f"AND job_type IN ({placeholders}) "
+            params = tuple(job_types)
         sql = (
             "SELECT * FROM collection_jobs "
-            "WHERE status IN ('pending', 'retry') AND attempts < max_attempts "
+            f"WHERE status IN ('pending', 'retry') AND attempts < max_attempts {type_filter}"
             "ORDER BY priority DESC, scheduled_at ASC, id ASC LIMIT ?"
         )
+        params = (*params, limit)
         if self.is_postgres:
             sql = sql.replace("?", "%s")
-        return self._fetchall(sql, (limit,))
+        return self._fetchall(sql, params)
 
     def count_jobs_by_status(self) -> Dict[str, int]:
         rows = self._fetchall("SELECT status, COUNT(*) AS count FROM collection_jobs GROUP BY status")
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def count_rows(self, table: str) -> int:
+        allowed = {"comments", "replies", "stories", "collection_jobs", "raw_payloads", "post_media"}
+        if table not in allowed:
+            raise ValueError(f"Unsupported table for count: {table}")
+        row = self._fetchone(f"SELECT COUNT(*) AS count FROM {table}")
+        return int(row["count"]) if row else 0
+
+    def cleanup_comments_data(self) -> Dict[str, int]:
+        before = {
+            "replies": self.count_rows("replies"),
+            "comments": self.count_rows("comments"),
+            "comment_jobs": self._count_jobs_for_types(("comments", "replies")),
+        }
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(f"DELETE FROM raw_payloads WHERE entity_type IN ({self.placeholder}, {self.placeholder})", ("comment", "reply"))
+            cur.execute(f"DELETE FROM collection_jobs WHERE job_type IN ({self.placeholder}, {self.placeholder})", ("comments", "replies"))
+            cur.execute("DELETE FROM replies")
+            cur.execute("DELETE FROM comments")
+        self.conn.commit()
+        return before
+
+    def cleanup_stories_data(self) -> Dict[str, int]:
+        before = {"stories": self.count_rows("stories")}
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(f"DELETE FROM raw_payloads WHERE entity_type = {self.placeholder}", ("story",))
+            cur.execute("DELETE FROM stories")
+        self.conn.commit()
+        return before
+
+    def _count_jobs_for_types(self, job_types: Tuple[str, ...]) -> int:
+        placeholders = ", ".join([self.placeholder] * len(job_types))
+        row = self._fetchone(
+            f"SELECT COUNT(*) AS count FROM collection_jobs WHERE job_type IN ({placeholders})",
+            tuple(job_types),
+        )
+        return int(row["count"]) if row else 0
 
     def mark_job_started(self, job_id: int) -> None:
         sql = "UPDATE collection_jobs SET status = 'running', started_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = ?"

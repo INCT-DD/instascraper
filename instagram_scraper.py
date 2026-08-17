@@ -406,8 +406,95 @@ def _normalize_v1_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "video_view_count": views,
         "is_video": media_type_num == 2,
         "accessibility_caption": item.get("accessibility_caption"),
+        "media_assets": _extract_media_assets(item),
         "raw_json": item,
     }
+
+
+def _extract_media_assets(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    assets: List[Dict[str, Any]] = []
+    carousel_items = item.get("carousel_media")
+    if isinstance(carousel_items, list):
+        for index, child in enumerate(carousel_items, start=1):
+            if isinstance(child, dict):
+                assets.extend(_extract_single_media_asset(child, index=index))
+        return assets
+
+    return _extract_single_media_asset(item, index=1)
+
+
+def _extract_single_media_asset(item: Dict[str, Any], index: int) -> List[Dict[str, Any]]:
+    assets: List[Dict[str, Any]] = []
+    media_id = str(item.get("pk") or item.get("id") or "")
+    image_url = _best_image_url(item)
+    video_url = _best_video_url(item)
+    if image_url:
+        assets.append(
+            {
+                "index": index,
+                "media_id": media_id,
+                "media_type": "image",
+                "url": image_url,
+                "width": _media_dimension(item, "width"),
+                "height": _media_dimension(item, "height"),
+            }
+        )
+    if video_url:
+        assets.append(
+            {
+                "index": index,
+                "media_id": media_id,
+                "media_type": "video",
+                "url": video_url,
+                "width": _media_dimension(item, "width"),
+                "height": _media_dimension(item, "height"),
+            }
+        )
+    return assets
+
+
+def _best_image_url(item: Dict[str, Any]) -> Optional[str]:
+    versions = item.get("image_versions2")
+    if isinstance(versions, dict):
+        candidates = versions.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            best = max(
+                [candidate for candidate in candidates if isinstance(candidate, dict)],
+                key=lambda candidate: int(candidate.get("width") or 0) * int(candidate.get("height") or 0),
+                default={},
+            )
+            if best.get("url"):
+                return str(best["url"])
+
+    display_resources = item.get("display_resources")
+    if isinstance(display_resources, list) and display_resources:
+        best = display_resources[-1]
+        if isinstance(best, dict) and best.get("src"):
+            return str(best["src"])
+
+    display_url = item.get("display_url")
+    return str(display_url) if display_url else None
+
+
+def _best_video_url(item: Dict[str, Any]) -> Optional[str]:
+    versions = item.get("video_versions")
+    if isinstance(versions, list) and versions:
+        best = max(
+            [candidate for candidate in versions if isinstance(candidate, dict)],
+            key=lambda candidate: int(candidate.get("width") or 0) * int(candidate.get("height") or 0),
+            default={},
+        )
+        if best.get("url"):
+            return str(best["url"])
+    video_url = item.get("video_url")
+    return str(video_url) if video_url else None
+
+
+def _media_dimension(item: Dict[str, Any], key: str) -> Optional[int]:
+    value = item.get(f"original_{key}") or item.get(key)
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _first_int(*values: Any) -> Optional[int]:
@@ -468,6 +555,7 @@ def parse_post_metadata(node: Dict[str, Any]) -> Dict[str, Any]:
         "views": node.get("video_view_count"),
         "is_video": node.get("is_video", False),
         "accessibility_caption": node.get("accessibility_caption"),
+        "media_assets": node.get("media_assets", []),
         "raw_json": node.get("raw_json", node),
         "comments": [],
     }
