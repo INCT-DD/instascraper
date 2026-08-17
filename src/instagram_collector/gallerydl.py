@@ -34,6 +34,7 @@ class GalleryDlStoryCollector:
         username: str,
         run_date: date,
         sessions: Iterable[CollectorSession],
+        candidate_name: Optional[str] = None,
     ) -> StoryCollectionResult:
         if not self.settings.gallery_dl_enabled:
             return StoryCollectionResult(username, "disabled", "skipped", 0, "")
@@ -54,7 +55,7 @@ class GalleryDlStoryCollector:
 
         last_error = None
         for session in sessions:
-            result = self._collect_with_session(username, run_date, session)
+            result = self._collect_with_session(username, run_date, session, candidate_name=candidate_name)
             if result.status == "success":
                 return result
             last_error = result.error_message
@@ -64,7 +65,7 @@ class GalleryDlStoryCollector:
             session_alias="exhausted",
             status="failed",
             files_found=0,
-            output_dir=str(self._target_dir(run_date, username)),
+            output_dir=str(self._target_dir(run_date, username, candidate_name=candidate_name)),
             error_message=last_error or "All configured gallery-dl sessions failed.",
         )
 
@@ -73,8 +74,9 @@ class GalleryDlStoryCollector:
         username: str,
         run_date: date,
         session: CollectorSession,
+        candidate_name: Optional[str] = None,
     ) -> StoryCollectionResult:
-        target_dir = self._target_dir(run_date, username)
+        target_dir = self._target_dir(run_date, username, candidate_name=candidate_name)
         target_dir.mkdir(parents=True, exist_ok=True)
         stories_before = self._story_count(target_dir)
 
@@ -180,7 +182,9 @@ class GalleryDlStoryCollector:
             return False
         return all(len(line.split("\t")) == 7 for line in cookie_lines)
 
-    def _target_dir(self, run_date: date, username: str) -> Path:
+    def _target_dir(self, run_date: date, username: str, candidate_name: Optional[str] = None) -> Path:
+        if self.settings.story_media_dir:
+            return Path(self.settings.story_media_dir) / safe_name(candidate_name or username) / "stories" / run_date.isoformat()
         return Path(self.settings.data_dir) / "raw" / "stories" / run_date.isoformat() / safe_name(username)
 
     def _file_count(self, path: Path) -> int:

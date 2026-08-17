@@ -9,6 +9,7 @@ O objetivo principal e permitir coleta recorrente e auditavel de metadados publi
 - [Visao geral](#visao-geral)
 - [Arquitetura](#arquitetura)
 - [Fluxos de coleta](#fluxos-de-coleta)
+- [Modo eleitoral e OneDrive](#modo-eleitoral-e-onedrive)
 - [Coleta de posts em detalhe](#coleta-de-posts-em-detalhe)
 - [Comandos principais](#comandos-principais)
 - [Arquivos de configuracao](#arquivos-de-configuracao)
@@ -160,6 +161,117 @@ Ou para um perfil:
 docker compose run --rm app python -m pipeline collect-stories --date 2026-08-07 --username lulaoficial
 ```
 
+## Modo Eleitoral e OneDrive
+
+Para o monitoramento iniciado em 16/08/2026, o projeto pode operar em um modo mais enxuto:
+
+- posts ligados;
+- comentarios desligados;
+- stories ligados;
+- midias dos posts ligadas;
+- exports organizados por candidato/perfil.
+
+Configuracao recomendada no `.env`:
+
+```env
+COLLECT_POSTS_DEFAULT=true
+COLLECT_STORIES_DEFAULT=true
+COLLECT_COMMENTS_DEFAULT=false
+COLLECT_REPLIES_DEFAULT=false
+COLLECT_POST_MEDIA=true
+GALLERY_DL_ENABLED=true
+```
+
+### Armazenamento no OneDrive
+
+O projeto nao precisa chamar a API do OneDrive. A forma mais simples e robusta e montar uma pasta sincronizada do OneDrive como `/app/exports` no container.
+
+No `.env`, configure:
+
+```env
+HOST_EXPORTS_DIR=C:/Users/Ricardo/OneDrive/Documentos/laboratorio/instagram-monitoring
+CANDIDATE_ARCHIVE_DIR=/app/exports/instagram
+POST_MEDIA_DIR=/app/exports/instagram
+STORY_MEDIA_DIR=/app/exports/instagram
+```
+
+Com isso, os arquivos aparecem no host em:
+
+```text
+C:/Users/Ricardo/OneDrive/Documentos/laboratorio/instagram-monitoring/instagram/
+```
+
+E dentro do container em:
+
+```text
+/app/exports/instagram/
+```
+
+### Estrutura por candidato
+
+A coleta de posts gera um JSON por candidato/perfil:
+
+```text
+instagram/
+  Nome_do_Candidato/
+    16082026.json
+    media/
+      2026-08-16/
+        SHORTCODE/
+          01_image.jpg
+          02_video.mp4
+    stories/
+      2026-08-16/
+```
+
+Quando a coleta cobre mais de um dia, o arquivo usa intervalo:
+
+```text
+14082026_16082026.json
+```
+
+O JSON contem metadados da coleta, posts e `media_assets` com URL original, caminho local, status de download e erro quando houver.
+
+### CSVs de candidatos
+
+`PROFILES_PATH` pode apontar para:
+
+- um `profiles.json`;
+- um arquivo `.csv`;
+- uma pasta contendo varios `.csv` e/ou `.json`.
+
+Exemplo:
+
+```env
+PROFILES_PATH=/app/profiles
+```
+
+Nesse caso, monte a pasta no `docker-compose.yml` ou consolide seus CSVs em `profiles.json`. O leitor de CSV tenta reconhecer colunas como `username`, `instagram`, `perfil`, `handle`, `arroba`, `nome` e URLs do Instagram. Ele tambem entende arquivos com duas linhas de cabecalho, como planilhas em que `Instagram` aparece na segunda linha sob um agrupador de redes sociais.
+
+Observacao importante: CSV nao preserva cor de celula. Se candidatos estiverem marcados em vermelho na planilha original, essa informacao nao fica disponivel no `.csv`. Para excluir esses perfis automaticamente, inclua uma coluna textual como `coletar=false`, `excluir=sim`, `vermelho=sim` ou `status=nao coletar` antes de importar.
+
+Depois de alterar os arquivos de perfis:
+
+```powershell
+docker compose run --rm app python -m pipeline seed-profiles
+```
+
+### Limpeza de comentarios e stories
+
+Para consultar o que seria removido, sem apagar:
+
+```powershell
+docker compose run --rm app python -m pipeline cleanup-secondary-data --comments --stories --story-media-files
+```
+
+Para remover de fato comentarios, replies, jobs de comentarios, registros de stories e arquivos locais de stories:
+
+```powershell
+docker compose run --rm app python -m pipeline cleanup-secondary-data --comments --stories --story-media-files --confirm
+```
+
+Posts ja coletados sao preservados.
+
 ## Coleta de Posts em Detalhe
 
 A coleta de posts foi desenhada para monitorar perfis publicos definidos na base de dados, respeitando um intervalo de datas e mantendo rastreabilidade do que foi retornado pelo Instagram. Ela nao usa a API oficial da Meta. A v0 trabalha com endpoints web/privados do Instagram, autenticados por cookies de contas coletoras.
@@ -309,6 +421,7 @@ Alguns erros nao significam necessariamente perda da coleta:
 | `run-scheduled` | Executa a coleta diaria com comportamento voltado para cron: pode exportar e notificar falhas. |
 | `collect-posts` | Coleta posts por periodo, com opcao de filtrar por perfil. |
 | `collect-stories` | Coleta stories disponiveis no momento da execucao. |
+| `process-media-queue` | Processa a fila pendente de downloads de midias de posts e stories. Com `--watch`, fica rodando continuamente. |
 | `process-comments-queue` | Processa a fila pendente de comentarios/replies. |
 | `process-jobs` | Alias operacional para processamento da fila. |
 | `export` | Gera exportacao do dia em pasta propria. |
@@ -346,6 +459,17 @@ Variaveis importantes:
 | `TIMEZONE` | Timezone usada para janela diaria. Exemplo: `America/Bahia`. |
 | `RPS` | Requisicoes por segundo. Use valores conservadores, como `0.2` a `0.5`. |
 | `MARGIN_DAYS` | Dias adicionais para tras na coleta diaria. |
+| `COLLECT_POSTS_DEFAULT` | Ativa posts por padrao no `run-daily` e `run-scheduled`. |
+| `COLLECT_STORIES_DEFAULT` | Ativa stories por padrao. Para o modo eleitoral com stories, use `true`. |
+| `COLLECT_COMMENTS_DEFAULT` | Ativa enfileiramento de comentarios por padrao. Para o modo eleitoral, use `false`. |
+| `COLLECT_POST_MEDIA` | Baixa midias dos posts quando disponiveis no payload. |
+| `MEDIA_QUEUE_ENABLED` | Quando `true`, posts e stories criam jobs de midia; o `media-worker` baixa sem travar a coleta. |
+| `MEDIA_QUEUE_LIMIT` | Quantidade maxima de jobs de midia processados por ciclo do worker. |
+| `MEDIA_WORKER_SLEEP_SECONDS` | Intervalo de espera entre ciclos do `media-worker`. |
+| `HOST_EXPORTS_DIR` | Pasta do host montada como `/app/exports`; pode ser uma pasta sincronizada do OneDrive. |
+| `CANDIDATE_ARCHIVE_DIR` | Pasta dentro do container onde os JSONs por candidato serao gravados. |
+| `POST_MEDIA_DIR` | Pasta dentro do container onde as midias de posts serao gravadas. |
+| `STORY_MEDIA_DIR` | Pasta dentro do container onde os stories serao gravados por candidato. |
 | `ACCOUNT_ROTATION_ENABLED` | Ativa rotacao entre sessoes do `sessions.json`. |
 | `GALLERY_DL_ENABLED` | Ativa ou desativa coleta de stories via `gallery-dl`. |
 | `NOTIFY_ENABLED` | Ativa notificacoes para `run-scheduled`. |
@@ -441,7 +565,7 @@ Volumes:
 | `media_data` | `/app/data` | Dados brutos, posts NDJSON, stories e midias. |
 | `logs_data` | `/app/logs` | Logs da aplicacao. |
 | `reports_data` | `/app/reports` | Relatorios JSON diarios. |
-| `exports_data` | `/app/exports` | Exportacoes para consulta externa. |
+| `HOST_EXPORTS_DIR` | `/app/exports` | Exportacoes e arquivos por candidato. Pode apontar para OneDrive. |
 
 Arquivos locais montados como somente leitura:
 
@@ -456,6 +580,8 @@ Subir ambiente:
 ```powershell
 docker compose up -d --build
 ```
+
+Esse comando sobe `postgres`, `app` e `media-worker`. Com `MEDIA_QUEUE_ENABLED=true`, a coleta diaria enfileira midias de posts e stories, e o `media-worker` baixa os arquivos automaticamente em segundo plano.
 
 Rodar migrations:
 
@@ -481,6 +607,7 @@ Tabelas principais:
 | `collection_runs` | Execucoes gerais da pipeline. |
 | `profile_collection_status` | Status por perfil em uma execucao. |
 | `posts` | Posts coletados e metricas normalizadas. |
+| `post_media` | Indice das midias de posts baixadas localmente/OneDrive. |
 | `stories` | Stories coletados e caminho de midia. |
 | `comments` | Comentarios coletados. |
 | `replies` | Replies de comentarios. |

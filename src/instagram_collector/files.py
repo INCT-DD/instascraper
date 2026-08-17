@@ -89,6 +89,36 @@ def write_daily_report(reports_dir: str, run_date: date, report: Dict[str, Any])
     return write_json(Path(reports_dir) / f"{run_date.isoformat()}.json", report)
 
 
+def archive_filename(date_from: date, date_to: date) -> str:
+    start = date_from.strftime("%d%m%Y")
+    end = date_to.strftime("%d%m%Y")
+    return f"{start}.json" if start == end else f"{start}_{end}.json"
+
+
+def write_candidate_archive(
+    archive_dir: str,
+    candidate_name: str,
+    username: str,
+    date_from: date,
+    date_to: date,
+    posts: List[Dict[str, Any]],
+) -> Path:
+    payload = {
+        "platform": "instagram",
+        "candidate_name": candidate_name,
+        "username": username,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "posts_count": len(posts),
+        "posts": posts,
+    }
+    return write_json(
+        Path(archive_dir) / safe_name(candidate_name) / archive_filename(date_from, date_to),
+        payload,
+    )
+
+
 def export_day(data_dir: str, reports_dir: str, exports_dir: str, run_date: date) -> Path:
     target = Path(exports_dir) / run_date.isoformat()
     if target.exists():
