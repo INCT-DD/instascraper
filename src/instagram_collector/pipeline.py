@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from instagram_scraper import AuthError, ScrapeError
 
 from .config import Settings, load_profiles, load_sessions
-from .files import ensure_runtime_dirs, write_candidate_archive, write_daily_report, write_profile_posts
+from .files import dated_export_root, ensure_runtime_dirs, write_candidate_archive, write_daily_report, write_profile_posts
 from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor, JobStats
 from .media_jobs import JOB_TYPE_POST_MEDIA, JOB_TYPE_STORIES
@@ -392,10 +392,14 @@ async def collect_profile(
         async with InstagramCollector(cookie_path, rps or settings.rps) as scraper:
             posts = await scraper.fetch_profile_posts(username, date_from, date_to)
 
+        export_date_from = archive_date_from or date_from.date()
+        export_date_to = archive_date_to or date_to.date()
+        post_media_base_dir = dated_export_root(settings.post_media_dir, export_date_from, export_date_to)
+
         if settings.collect_post_media and posts and not settings.media_queue_enabled:
             media_stats = await download_post_media(
                 posts,
-                settings.post_media_dir,
+                str(post_media_base_dir),
                 output_date or date_to.date(),
                 str(profile.get("name") or username),
                 settings.post_media_timeout_seconds,
@@ -409,8 +413,8 @@ async def collect_profile(
             settings.candidate_archive_dir,
             str(profile.get("name") or username),
             username,
-            archive_date_from or date_from.date(),
-            archive_date_to or date_to.date(),
+            export_date_from,
+            export_date_to,
             posts,
         )
         stats.posts_found = len(posts)
@@ -424,6 +428,7 @@ async def collect_profile(
                     media_count += 1
                     if settings.collect_post_media and settings.media_queue_enabled:
                         media.setdefault("download_status", "pending")
+                        media["export_base_dir"] = str(post_media_base_dir)
                     db.upsert_post_media(post_id, media)
             if settings.collect_post_media and settings.media_queue_enabled and media_count:
                 pending_media = db.list_post_media_for_post(post_id, only_pending=True)

@@ -17,7 +17,7 @@ sys.path.insert(0, str(SRC))
 import instagram_scraper
 import instagram_collector.pipeline as pipeline_module
 from instagram_collector.config import load_profiles
-from instagram_collector.files import archive_filename
+from instagram_collector.files import archive_filename, dated_export_folder_name, write_candidate_archive
 from instagram_collector.pipeline import (
     PostCollectionAttempt,
     ProfileCollectionStats,
@@ -105,6 +105,32 @@ class ArchiveFileTests(unittest.TestCase):
     def test_archive_filename_uses_day_month_year(self) -> None:
         self.assertEqual(archive_filename(date(2026, 8, 16), date(2026, 8, 16)), "16082026.json")
         self.assertEqual(archive_filename(date(2026, 8, 14), date(2026, 8, 16)), "14082026_16082026.json")
+
+    def test_dated_export_folder_name_uses_day_month_short_year(self) -> None:
+        self.assertEqual(
+            dated_export_folder_name("instagram", date(2026, 8, 31), date(2026, 8, 31)),
+            "instagram_31-08-26",
+        )
+        self.assertEqual(
+            dated_export_folder_name("instagram", date(2026, 8, 30), date(2026, 8, 31)),
+            "instagram_30-08-26-to-31-08-26",
+        )
+
+    def test_candidate_archive_uses_dated_export_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = write_candidate_archive(
+                str(Path(tmp) / "instagram"),
+                "Candidato Teste",
+                "candidato",
+                date(2026, 8, 30),
+                date(2026, 8, 31),
+                [],
+            )
+
+        self.assertEqual(
+            path.parts[-3:],
+            ("instagram_30-08-26-to-31-08-26", "Candidato_Teste", "30082026_31082026.json"),
+        )
 
 
 class PostMediaParsingTests(unittest.TestCase):

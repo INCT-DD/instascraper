@@ -90,7 +90,8 @@ async def _download_asset(
     response = await client.get(str(asset["url"]))
     response.raise_for_status()
     extension = _extension(asset, response.headers.get("content-type", ""))
-    target_dir = Path(base_dir) / safe_name(candidate_name) / "media" / run_date.isoformat() / shortcode
+    export_base_dir = str(asset.get("export_base_dir") or base_dir)
+    target_dir = Path(export_base_dir) / safe_name(candidate_name) / "media" / run_date.isoformat() / shortcode
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{index:02d}_{media_type}{extension}"
     target.write_bytes(response.content)

@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from typing import Dict, Iterable, List, Optional
 
 from .config import Settings
-from .files import safe_name
+from .files import dated_export_root, safe_name
 from .sessions import CollectorSession
 
 
@@ -184,7 +184,12 @@ class GalleryDlStoryCollector:
 
     def _target_dir(self, run_date: date, username: str, candidate_name: Optional[str] = None) -> Path:
         if self.settings.story_media_dir:
-            return Path(self.settings.story_media_dir) / safe_name(candidate_name or username) / "stories" / run_date.isoformat()
+            return (
+                dated_export_root(self.settings.story_media_dir, run_date, run_date)
+                / safe_name(candidate_name or username)
+                / "stories"
+                / run_date.isoformat()
+            )
         return Path(self.settings.data_dir) / "raw" / "stories" / run_date.isoformat() / safe_name(username)
 
     def _file_count(self, path: Path) -> int:

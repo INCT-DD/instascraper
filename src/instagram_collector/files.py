@@ -95,6 +95,18 @@ def archive_filename(date_from: date, date_to: date) -> str:
     return f"{start}.json" if start == end else f"{start}_{end}.json"
 
 
+def dated_export_folder_name(base_name: str, date_from: date, date_to: date) -> str:
+    start = date_from.strftime("%d-%m-%y")
+    end = date_to.strftime("%d-%m-%y")
+    suffix = start if start == end else f"{start}-to-{end}"
+    return f"{base_name}_{suffix}"
+
+
+def dated_export_root(base_dir: str, date_from: date, date_to: date) -> Path:
+    base = Path(base_dir)
+    return base.with_name(dated_export_folder_name(base.name, date_from, date_to))
+
+
 def write_candidate_archive(
     archive_dir: str,
     candidate_name: str,
@@ -114,7 +126,9 @@ def write_candidate_archive(
         "posts": posts,
     }
     return write_json(
-        Path(archive_dir) / safe_name(candidate_name) / archive_filename(date_from, date_to),
+        dated_export_root(archive_dir, date_from, date_to)
+        / safe_name(candidate_name)
+        / archive_filename(date_from, date_to),
         payload,
     )
 
