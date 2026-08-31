@@ -198,13 +198,20 @@ STORY_MEDIA_DIR=/app/exports/instagram
 Com isso, os arquivos aparecem no host em:
 
 ```text
-C:/Users/Ricardo/OneDrive/Documentos/laboratorio/instagram-monitoring/instagram/
+C:/Users/Ricardo/OneDrive/Documentos/laboratorio/instagram-monitoring/instagram_31-08-26/
 ```
 
 E dentro do container em:
 
 ```text
-/app/exports/instagram/
+/app/exports/instagram_31-08-26/
+```
+
+O valor configurado continua sendo a raiz base `/app/exports/instagram`. A aplicacao acrescenta automaticamente a data ou o periodo da coleta:
+
+```text
+instagram_31-08-26
+instagram_30-08-26-to-31-08-26
 ```
 
 ### Estrutura por candidato
@@ -212,7 +219,7 @@ E dentro do container em:
 A coleta de posts gera um JSON por candidato/perfil:
 
 ```text
-instagram/
+instagram_31-08-26/
   Nome_do_Candidato/
     16082026.json
     media/
@@ -227,6 +234,7 @@ instagram/
 Quando a coleta cobre mais de um dia, o arquivo usa intervalo:
 
 ```text
+instagram_14-08-26-to-16-08-26/
 14082026_16082026.json
 ```
 
