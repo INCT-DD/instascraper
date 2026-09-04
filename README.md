@@ -231,12 +231,17 @@ instagram_31-08-26/
       2026-08-16/
 ```
 
-Quando a coleta cobre mais de um dia, o arquivo usa intervalo:
+Quando a coleta cobre mais de um dia, a pasta usa o intervalo completo e cada dia recebe seu proprio JSON:
 
 ```text
 instagram_14-08-26-to-16-08-26/
-14082026_16082026.json
+  Nome_do_Candidato/
+    14082026.json
+    15082026.json
+    16082026.json
 ```
+
+Os arquivos diarios sao criados mesmo quando o perfil nao publicou naquele dia. Nesse caso, posts_count e zero e posts e uma lista vazia. Os campos collection_date_from e collection_date_to preservam o periodo completo que originou os arquivos.
 
 O JSON contem metadados da coleta, posts e `media_assets` com URL original, caminho local, status de download e erro quando houver.
 
