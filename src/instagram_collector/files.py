@@ -4,7 +4,7 @@ import csv
 import json
 import shutil
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -107,6 +107,72 @@ def dated_export_root(base_dir: str, date_from: date, date_to: date) -> Path:
     return base.with_name(dated_export_folder_name(base.name, date_from, date_to))
 
 
+def _date_range(date_from: date, date_to: date) -> Iterable[date]:
+    if date_to < date_from:
+        raise ValueError("date_to must be greater than or equal to date_from")
+    current = date_from
+    while current <= date_to:
+        yield current
+        current += timedelta(days=1)
+
+
+def _post_date(post: Dict[str, Any], fallback: date) -> date:
+    taken_at_iso = str(post.get("taken_at_iso") or "")
+    if len(taken_at_iso) >= 10:
+        try:
+            return date.fromisoformat(taken_at_iso[:10])
+        except ValueError:
+            pass
+
+    taken_at = post.get("taken_at")
+    if taken_at:
+        try:
+            return datetime.fromtimestamp(int(taken_at), tz=timezone.utc).date()
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    return fallback
+
+
+def write_candidate_archives(
+    archive_dir: str,
+    candidate_name: str,
+    username: str,
+    date_from: date,
+    date_to: date,
+    posts: List[Dict[str, Any]],
+) -> List[Path]:
+    export_dir = dated_export_root(archive_dir, date_from, date_to) / safe_name(candidate_name)
+    posts_by_date = {run_date: [] for run_date in _date_range(date_from, date_to)}
+    for post in posts:
+        run_date = _post_date(post, date_to)
+        if run_date not in posts_by_date:
+            run_date = date_to
+        posts_by_date[run_date].append(post)
+
+    generated_at = datetime.now(tz=timezone.utc).isoformat()
+    paths = []
+    for run_date, daily_posts in posts_by_date.items():
+        payload = {
+            "platform": "instagram",
+            "candidate_name": candidate_name,
+            "username": username,
+            "date_from": run_date.isoformat(),
+            "date_to": run_date.isoformat(),
+            "collection_date_from": date_from.isoformat(),
+            "collection_date_to": date_to.isoformat(),
+            "generated_at": generated_at,
+            "posts_count": len(daily_posts),
+            "posts": daily_posts,
+        }
+        paths.append(write_json(export_dir / archive_filename(run_date, run_date), payload))
+
+    if date_from != date_to:
+        legacy_archive = export_dir / archive_filename(date_from, date_to)
+        if legacy_archive.exists():
+            legacy_archive.unlink()
+    return paths
+
+
 def write_candidate_archive(
     archive_dir: str,
     candidate_name: str,
@@ -115,22 +181,15 @@ def write_candidate_archive(
     date_to: date,
     posts: List[Dict[str, Any]],
 ) -> Path:
-    payload = {
-        "platform": "instagram",
-        "candidate_name": candidate_name,
-        "username": username,
-        "date_from": date_from.isoformat(),
-        "date_to": date_to.isoformat(),
-        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "posts_count": len(posts),
-        "posts": posts,
-    }
-    return write_json(
-        dated_export_root(archive_dir, date_from, date_to)
-        / safe_name(candidate_name)
-        / archive_filename(date_from, date_to),
-        payload,
-    )
+    """Compatibility wrapper returning the last daily archive path."""
+    return write_candidate_archives(
+        archive_dir,
+        candidate_name,
+        username,
+        date_from,
+        date_to,
+        posts,
+    )[-1]
 
 
 def export_day(data_dir: str, reports_dir: str, exports_dir: str, run_date: date) -> Path:

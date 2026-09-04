@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, time, timezone
+import json
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -17,7 +18,7 @@ sys.path.insert(0, str(SRC))
 import instagram_scraper
 import instagram_collector.pipeline as pipeline_module
 from instagram_collector.config import load_profiles
-from instagram_collector.files import archive_filename, dated_export_folder_name, write_candidate_archive
+from instagram_collector.files import archive_filename, dated_export_folder_name, write_candidate_archives
 from instagram_collector.pipeline import (
     PostCollectionAttempt,
     ProfileCollectionStats,
@@ -116,21 +117,30 @@ class ArchiveFileTests(unittest.TestCase):
             "instagram_30-08-26-to-31-08-26",
         )
 
-    def test_candidate_archive_uses_dated_export_root(self) -> None:
+    def test_candidate_archives_split_period_into_daily_files(self) -> None:
         with TemporaryDirectory() as tmp:
-            path = write_candidate_archive(
+            paths = write_candidate_archives(
                 str(Path(tmp) / "instagram"),
                 "Candidato Teste",
                 "candidato",
-                date(2026, 8, 30),
+                date(2026, 8, 29),
                 date(2026, 8, 31),
-                [],
+                [
+                    {"shortcode": "A", "taken_at_iso": "2026-08-29T12:00:00+00:00"},
+                    {"shortcode": "B", "taken_at_iso": "2026-08-31T12:00:00+00:00"},
+                ],
             )
 
-        self.assertEqual(
-            path.parts[-3:],
-            ("instagram_30-08-26-to-31-08-26", "Candidato_Teste", "30082026_31082026.json"),
-        )
+            self.assertEqual(
+                [path.name for path in paths],
+                ["29082026.json", "30082026.json", "31082026.json"],
+            )
+            self.assertTrue(all(path.parts[-3] == "instagram_29-08-26-to-31-08-26" for path in paths))
+            payloads = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+        self.assertEqual([payload["posts_count"] for payload in payloads], [1, 0, 1])
+        self.assertEqual(payloads[0]["collection_date_from"], "2026-08-29")
+        self.assertEqual(payloads[0]["collection_date_to"], "2026-08-31")
 
 
 class PostMediaParsingTests(unittest.TestCase):

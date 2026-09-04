@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from instagram_scraper import AuthError, ScrapeError
 
 from .config import Settings, load_profiles, load_sessions
-from .files import dated_export_root, ensure_runtime_dirs, write_candidate_archive, write_daily_report, write_profile_posts
+from .files import dated_export_root, ensure_runtime_dirs, write_candidate_archives, write_daily_report, write_profile_posts
 from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor, JobStats
 from .media_jobs import JOB_TYPE_POST_MEDIA, JOB_TYPE_STORIES
@@ -409,7 +409,7 @@ async def collect_profile(
             stats.media_failed = media_stats.failed
 
         write_profile_posts(settings.data_dir, output_date or date_to.date(), username, posts)
-        write_candidate_archive(
+        write_candidate_archives(
             settings.candidate_archive_dir,
             str(profile.get("name") or username),
             username,
