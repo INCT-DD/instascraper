@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import smtplib
 import ssl
@@ -103,7 +102,7 @@ def send_report_notification(
 def report_has_failure(report: Dict[str, Any]) -> bool:
     return any(
         [
-            report.get("status") == "failed",
+            report.get("status") in {"failed", "partial"},
             int(report.get("profiles_error") or 0) > 0,
             int(report.get("jobs_failed") or 0) > 0,
             bool(report.get("errors")),

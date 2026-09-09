@@ -25,6 +25,12 @@ class JobStats:
     comments_inserted: int = 0
     replies_inserted: int = 0
 
+    @property
+    def run_status(self) -> str:
+        if self.failed:
+            return "partial" if self.processed else "failed"
+        return "success"
+
 
 class JobProcessor:
     def __init__(
@@ -63,7 +69,7 @@ class JobProcessor:
                 stats.comments_inserted += counts.get("comments_inserted", 0)
                 stats.replies_inserted += counts.get("replies_inserted", 0)
                 print(f"Job {job['id']} done: {job['job_type']}")
-            except (AuthError, ScrapeError, Exception) as exc:
+            except Exception as exc:
                 self.db.mark_job_failed(job["id"], str(exc))
                 stats.failed += 1
                 print(f"Job {job['id']} failed: {exc}")

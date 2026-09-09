@@ -22,10 +22,10 @@ from instagram_scraper import (
 class InstagramCollector:
     """Non-interactive wrapper around the existing scraper engine."""
 
-    def __init__(self, cookie_json_path: str, rps: float) -> None:
+    def __init__(self, cookie_json_path: str, rps: float, limiter: Optional[RateLimiter] = None) -> None:
         self.cookie_json_path = cookie_json_path
         self.rps = rps
-        self.limiter = RateLimiter(rps)
+        self.limiter = limiter if limiter is not None else RateLimiter(rps)
         self.cookie_str = build_cookie_string(load_cookies(cookie_json_path))
         self.client: Optional[httpx.AsyncClient] = None
 
@@ -51,7 +51,7 @@ class InstagramCollector:
         if not self.client:
             raise RuntimeError("InstagramCollector must be used as an async context manager.")
 
-        user_id = await fetch_user_id(self.client, username, self.cookie_str)
+        user_id = await fetch_user_id(self.client, username, self.cookie_str, limiter=self.limiter)
         collected_posts: List[Dict[str, Any]] = []
         after = None
         ts_from = int(date_from.timestamp())

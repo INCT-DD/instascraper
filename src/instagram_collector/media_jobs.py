@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, Optional
 
-from .config import Settings, load_sessions
+from .config import Settings, load_sessions, parse_iso_date
 from .gallerydl import GalleryDlStoryCollector
 from .post_media import download_post_media_asset
 from .sessions import SessionPool
@@ -42,14 +42,21 @@ class MediaJobProcessor:
 
     async def process_pending_jobs(self, limit: Optional[int] = None, quiet: bool = False) -> MediaJobStats:
         job_limit = limit if limit is not None else self.settings.job_limit_per_run
-        jobs = self.db.fetch_pending_jobs(job_limit, job_types=(JOB_TYPE_STORIES, JOB_TYPE_POST_MEDIA))
         stats = MediaJobStats()
-        if not jobs:
-            if not quiet:
-                print("No pending media jobs.")
-            return stats
-
-        for job in jobs:
+        attempted_ids = []
+        for _ in range(job_limit):
+            # Recheck priority between jobs; retry each job at most once per cycle.
+            jobs = self.db.fetch_pending_jobs(
+                1,
+                job_types=(JOB_TYPE_STORIES, JOB_TYPE_POST_MEDIA),
+                exclude_job_ids=tuple(attempted_ids),
+            )
+            if not jobs:
+                if not quiet and not attempted_ids:
+                    print("No pending media jobs.")
+                break
+            job = jobs[0]
+            attempted_ids.append(job["id"])
             self.db.mark_job_started(job["id"])
             try:
                 counts = await self._process_job(job)
@@ -126,7 +133,7 @@ class MediaJobProcessor:
         profile = self.db.get_profile(job["profile_id"])
         if not profile:
             raise ValueError(f"Profile not found for story job {job['id']}")
-        run_date = date.fromisoformat(str(job.get("cursor") or date.today().isoformat()))
+        run_date = parse_iso_date(job.get("cursor"), self.settings.timezone)
         session = self.session_pool.next()
         result = self.story_collector.collect_profile_stories(
             profile["username"],
@@ -153,4 +160,4 @@ class MediaJobProcessor:
                 return date.fromisoformat(taken_at_iso[:10])
             except ValueError:
                 pass
-        return date.today()
+        return parse_iso_date(None, self.settings.timezone)

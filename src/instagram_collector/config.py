@@ -5,30 +5,10 @@ import csv
 import io
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-
-DEFAULT_PROFILES: List[Dict[str, Any]] = [
-    {"name": "Lula", "username": "lulaoficial", "priority": 10},
-    {"name": "Flavio Bolsonaro", "username": "flaviobolsonaro", "priority": 10},
-    {"name": "Jair Bolsonaro", "username": "jairmessiasbolsonaro", "priority": 10},
-    {"name": "Ronaldo Caiado", "username": "ronaldocaiado", "priority": 8},
-    {"name": "Renan Santos", "username": "renansantosmbl", "priority": 8},
-    {"name": "Romeu Zema", "username": "romeuzemaoficial", "priority": 8},
-    {"name": "Michelle Bolsonaro", "username": "michellebolsonaro", "priority": 8},
-    {"name": "Eduardo Bolsonaro", "username": "bolsonarosp", "priority": 8},
-    {"name": "Joaquim Barbosa", "username": "joaquimbarbosaoficial", "priority": 7},
-    {"name": "Tarcisio de Freitas", "username": "tarcisiogdf", "priority": 8},
-    {"name": "Fernando Haddad", "username": "fernandohaddadoficial", "priority": 8},
-    {"name": "Aecio Neves", "username": "aecionevesoficial", "priority": 7},
-    {"name": "Augusto Cury", "username": "augustocury", "priority": 6},
-    {"name": "Cabo Daciolo", "username": "cabodaciolo", "priority": 6},
-    {"name": "Samara Martins", "username": "samaramartinsup", "priority": 6},
-    {"name": "Hertz Dias", "username": "hertzdiaspstu", "priority": 6},
-    {"name": "Edmilson Costa", "username": "edpcb", "priority": 6},
-]
+from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
@@ -64,6 +44,8 @@ class Settings:
     gallery_dl_binary: str
     gallery_dl_sleep_request: str
     gallery_dl_timeout_seconds: int
+    posts_backend: str = "auto"
+    instagram_timeline_doc_id: str = "7898261790222653"
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -94,6 +76,9 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
 
     exports_dir = os.environ.get("EXPORTS_DIR", "exports")
     candidate_archive_dir = os.environ.get("CANDIDATE_ARCHIVE_DIR", str(Path(exports_dir) / "instagram"))
+    posts_backend = os.environ.get("POSTS_BACKEND", "auto").strip().lower()
+    if posts_backend not in {"auto", "graphql", "scraper", "gallery-dl"}:
+        raise ValueError("POSTS_BACKEND must be auto, graphql, scraper or gallery-dl.")
     return Settings(
         database_url=os.environ.get("DATABASE_URL") or _database_url_from_postgres_env(),
         timezone=os.environ.get("TIMEZONE", "America/Bahia"),
@@ -126,12 +111,16 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
         gallery_dl_binary=os.environ.get("GALLERY_DL_BINARY", "gallery-dl"),
         gallery_dl_sleep_request=os.environ.get("GALLERY_DL_SLEEP_REQUEST", "6.0-12.0"),
         gallery_dl_timeout_seconds=int(os.environ.get("GALLERY_DL_TIMEOUT_SECONDS", "900")),
+        posts_backend=posts_backend,
+        instagram_timeline_doc_id=os.environ.get("INSTAGRAM_TIMELINE_DOC_ID", "7898261790222653"),
     )
 
 
-def parse_iso_date(value: Optional[str]) -> date:
+def parse_iso_date(value: Optional[str], timezone_name: Optional[str] = None) -> date:
     if value:
         return date.fromisoformat(value)
+    if timezone_name:
+        return datetime.now(ZoneInfo(timezone_name)).date()
     return date.today()
 
 
@@ -157,7 +146,11 @@ def _optional_int_env(name: str, default: Optional[int] = None) -> Optional[int]
 def load_profiles(path: str) -> List[Dict[str, Any]]:
     profile_path = Path(path)
     if not profile_path.exists():
-        return DEFAULT_PROFILES
+        raise FileNotFoundError(
+            f"Profiles path not found: {profile_path.resolve()}. "
+            "Set PROFILES_PATH to an existing JSON file, CSV file or directory, "
+            "or create profiles.json from profile.example.json."
+        )
 
     if profile_path.is_dir():
         profiles: List[Dict[str, Any]] = []
@@ -255,12 +248,12 @@ def _load_profiles_csv(path: Path) -> List[Dict[str, Any]]:
 
 def _read_text_with_fallback(path: Path) -> str:
     data = path.read_bytes()
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+    for encoding in ("utf-8-sig", "cp1252"):
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    return data.decode("latin-1", errors="replace")
+    return data.decode("latin-1")
 
 
 def _csv_headers(rows: List[List[str]]) -> tuple[List[str], int]:

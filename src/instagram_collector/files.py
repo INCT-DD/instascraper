@@ -107,6 +107,46 @@ def dated_export_root(base_dir: str, date_from: date, date_to: date) -> Path:
     return base.with_name(dated_export_folder_name(base.name, date_from, date_to))
 
 
+def story_media_directories(data_dir: str, story_media_dir: str) -> List[Path]:
+    targets = set()
+    legacy_root = Path(data_dir) / "raw"
+    legacy = legacy_root / "stories"
+    if legacy.is_dir() and not legacy.is_symlink() and legacy.resolve().parent == legacy_root.resolve():
+        targets.add(legacy.resolve())
+    if not story_media_dir:
+        return sorted(targets)
+
+    base = Path(story_media_dir)
+    roots = [base]
+    if base.parent.is_dir():
+        for sibling in base.parent.iterdir():
+            prefix = base.name + "_"
+            if not sibling.name.startswith(prefix):
+                continue
+            dates = sibling.name[len(prefix):].split("-to-")
+            if len(dates) not in {1, 2}:
+                continue
+            try:
+                parsed = [datetime.strptime(value, "%d-%m-%y").date() for value in dates]
+            except ValueError:
+                continue
+            if sibling.name == dated_export_folder_name(base.name, parsed[0], parsed[-1]):
+                roots.append(sibling)
+
+    for root in roots:
+        if not root.is_dir() or root.is_symlink() or root.resolve().parent != base.parent.resolve():
+            continue
+        for target in root.glob("*/stories"):
+            if (
+                target.is_dir()
+                and not target.is_symlink()
+                and not target.parent.is_symlink()
+                and target.resolve().is_relative_to(root.resolve())
+            ):
+                targets.add(target.resolve())
+    return sorted(targets)
+
+
 def _date_range(date_from: date, date_to: date) -> Iterable[date]:
     if date_to < date_from:
         raise ValueError("date_to must be greater than or equal to date_from")

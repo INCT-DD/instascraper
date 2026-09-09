@@ -3,16 +3,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import date
-from pathlib import Path
+from math import isfinite
 import shutil
 from typing import Optional
 
-from .config import load_sessions, load_settings, parse_iso_date
+from .config import Settings, load_sessions, load_settings, parse_iso_date
+from .files import story_media_directories
 from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor
 from .logging_setup import configure_logging
-from .media_jobs import MediaJobProcessor
-from .notifications import build_crash_report, send_report_notification
+from .media_jobs import JOB_TYPE_STORIES, MediaJobProcessor
+from .notifications import build_crash_report, report_has_failure, send_report_notification
 from .pipeline import collect_posts_period, export_collected_day, explicit_window, run_daily_collection, seed_profiles
 from .sessions import SessionPool
 from .storage import Database
@@ -28,15 +29,41 @@ def _collection_modes(args: argparse.Namespace, settings) -> tuple[bool, bool]:
     return settings.collect_posts_default, settings.collect_stories_default
 
 
+def _positive_rps(value: str) -> float:
+    try:
+        rps = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("RPS must be a number greater than zero.") from exc
+    if not isfinite(rps) or rps <= 0:
+        raise argparse.ArgumentTypeError("RPS must be a finite number greater than zero.")
+    return rps
+
+
+def _notify_report(report: dict, force: bool) -> None:
+    try:
+        notified = send_report_notification(report, force=force)
+        print(f"Notification sent: {notified}")
+    except Exception as exc:
+        print(f"Notification failed: {exc}")
+
+
+def _post_collection_exit_code(results: list[dict]) -> int:
+    failed = sum(1 for result in results if result.get("status") == "failed")
+    partial = sum(1 for result in results if result.get("status") == "partial")
+    succeeded = len(results) - failed - partial
+    print(f"Post collection finished: {succeeded} succeeded, {partial} partial, {failed} failed.")
+    return int(bool(failed or partial))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="instagram_collector")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    daily = sub.add_parser("run-daily", help="Run post collection for all active profiles.")
+    daily = sub.add_parser("run-daily", help="Run post/story collection for all active profiles.")
     daily.add_argument("--date", dest="target_date", help="Target date in YYYY-MM-DD. Defaults to today.")
     daily.add_argument("--margin-days", type=int, default=None)
-    daily.add_argument("--rps", type=float, default=None)
-    daily.add_argument("--skip-jobs", action="store_true", help="Only collect posts and enqueue jobs.")
+    daily.add_argument("--rps", type=_positive_rps, default=None)
+    daily.add_argument("--skip-jobs", action="store_true", help="Skip comment/reply processing; media workers are independent.")
     daily.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     daily.add_argument("--stories-only", action="store_true", help="Skip post collection.")
     daily.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
@@ -44,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     scheduled = sub.add_parser("run-scheduled", help="Run daily collection, export optionally, and notify on failures.")
     scheduled.add_argument("--date", dest="target_date", help="Target date in YYYY-MM-DD. Defaults to today.")
     scheduled.add_argument("--margin-days", type=int, default=None)
-    scheduled.add_argument("--rps", type=float, default=None)
-    scheduled.add_argument("--skip-jobs", action="store_true", help="Only collect posts/stories and enqueue jobs.")
+    scheduled.add_argument("--rps", type=_positive_rps, default=None)
+    scheduled.add_argument("--skip-jobs", action="store_true", help="Skip comment/reply processing; media workers are independent.")
     scheduled.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     scheduled.add_argument("--stories-only", action="store_true", help="Skip post collection.")
     scheduled.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
@@ -56,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     for command_name in ("process-jobs", "process-comments-queue"):
         jobs = sub.add_parser(command_name, help="Process pending comment/reply jobs.")
         jobs.add_argument("--limit", type=int, default=None)
-        jobs.add_argument("--rps", type=float, default=None)
+        jobs.add_argument("--rps", type=_positive_rps, default=None)
 
     media_jobs = sub.add_parser("process-media-queue", help="Process pending post media and story download jobs.")
     media_jobs.add_argument("--limit", type=int, default=None)
@@ -68,9 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
     posts.add_argument("--end-date", required=True)
     posts.add_argument("--username")
     posts.add_argument("--no-comments", action="store_true", help="Do not enqueue comment jobs.")
-    posts.add_argument("--rps", type=float, default=None)
+    posts.add_argument("--rps", type=_positive_rps, default=None)
+    retry = posts.add_mutually_exclusive_group()
+    retry.add_argument("--resume", action="store_true", help="Retry incomplete profiles for the exact date range, skipping latest successful attempts.")
+    retry.add_argument("--retry-failed", action="store_true", help="Retry only profiles whose latest attempt failed for the exact date range.")
 
-    stories = sub.add_parser("collect-stories", help="Collect currently available stories with gallery-dl.")
+    stories = sub.add_parser("collect-stories", help="Enqueue stories when MEDIA_QUEUE_ENABLED=true; otherwise download with gallery-dl.")
     stories.add_argument("--date", dest="target_date", help="Run date in YYYY-MM-DD. Defaults to today.")
     stories.add_argument("--username")
 
@@ -79,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--from", dest="date_from", required=True)
     profile.add_argument("--to", dest="date_to", required=True)
     profile.add_argument("--comments", action="store_true", help="Enqueue and process comment jobs after posts.")
-    profile.add_argument("--rps", type=float, default=None)
+    profile.add_argument("--rps", type=_positive_rps, default=None)
 
     export = sub.add_parser("export", help="Create a copyable export folder for a run date.")
     export.add_argument("--date", dest="target_date", required=True)
@@ -91,16 +121,26 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup = sub.add_parser("cleanup-secondary-data", help="Remove optional comments/stories data after confirmation.")
     cleanup.add_argument("--comments", action="store_true", help="Remove comments, replies and comment jobs.")
     cleanup.add_argument("--stories", action="store_true", help="Remove story rows and story raw payloads.")
-    cleanup.add_argument("--story-media-files", action="store_true", help="Also remove data/raw/stories files.")
+    cleanup.add_argument("--story-media-files", action="store_true", help="Remove story directories in dated exports and data/raw/stories.")
     cleanup.add_argument("--confirm", action="store_true", help="Actually delete data. Without this flag only prints counts.")
     return parser
 
 
-async def _run_async(args: argparse.Namespace) -> None:
-    settings = load_settings()
+async def _run_async(args: argparse.Namespace) -> Optional[int]:
+    run_date = date.today()
+    try:
+        settings = load_settings()
+        run_date = parse_iso_date(getattr(args, "target_date", None), settings.timezone)
+        return await _execute_command(args, settings, run_date)
+    except Exception as exc:
+        if args.command == "run-scheduled" and not args.no_notify:
+            _notify_report(build_crash_report(run_date, exc), force=args.notify)
+        raise
+
+
+async def _execute_command(args: argparse.Namespace, settings: Settings, run_date: date) -> Optional[int]:
     db = Database(settings.database_url)
     try:
-        run_date = parse_iso_date(getattr(args, "target_date", None))
         configure_logging(settings.logs_dir, run_date)
 
         if args.command == "init-db":
@@ -124,9 +164,11 @@ async def _run_async(args: argparse.Namespace) -> None:
                 )
             if args.stories:
                 print(f"Stories cleanup target: {db.count_rows('stories')} story rows.")
-            story_dir = Path(settings.data_dir) / "raw" / "stories"
+            story_dirs = []
             if args.story_media_files:
-                print(f"Story media cleanup target: {story_dir}")
+                story_dirs = story_media_directories(settings.data_dir, settings.story_media_dir)
+                for story_dir in story_dirs:
+                    print(f"Story media cleanup target: {story_dir}")
             if not args.confirm:
                 print("Dry run only. Re-run with --confirm to delete.")
                 return
@@ -136,7 +178,7 @@ async def _run_async(args: argparse.Namespace) -> None:
             if args.stories:
                 deleted = db.cleanup_stories_data()
                 print(f"Deleted stories data: {deleted}")
-            if args.story_media_files and story_dir.exists():
+            for story_dir in story_dirs:
                 shutil.rmtree(story_dir)
                 print(f"Deleted story media files: {story_dir}")
             return
@@ -149,7 +191,7 @@ async def _run_async(args: argparse.Namespace) -> None:
         db.init_schema()
 
         if args.command == "run-daily":
-            target_date = parse_iso_date(args.target_date)
+            target_date = run_date
             collect_posts_enabled, collect_stories_enabled = _collection_modes(args, settings)
             report = await run_daily_collection(
                 db,
@@ -166,49 +208,33 @@ async def _run_async(args: argparse.Namespace) -> None:
                 f"Daily run done: {report['posts_found']} posts, {report['stories_found']} story files, "
                 f"{report.get('jobs_processed', 0)} jobs processed, {report['profiles_error']} profile errors."
             )
-            return
+            return int(report_has_failure(report))
 
         if args.command == "run-scheduled":
-            target_date = parse_iso_date(args.target_date)
+            target_date = run_date
             collect_posts_enabled, collect_stories_enabled = _collection_modes(args, settings)
-            report = None
-            try:
-                report = await run_daily_collection(
-                    db,
-                    settings,
-                    target_date=target_date,
-                    margin_days=args.margin_days,
-                    rps=args.rps,
-                    process_jobs=not args.skip_jobs,
-                    collect_posts_enabled=collect_posts_enabled,
-                    collect_stories_enabled=collect_stories_enabled,
-                    retry_incomplete=args.retry_incomplete,
-                )
-                if args.export:
-                    export_path = export_collected_day(db, settings, target_date)
-                    report["export_path"] = str(export_path)
-            except Exception as exc:
-                report = build_crash_report(target_date, exc)
-                if not args.no_notify:
-                    try:
-                        notified = send_report_notification(report, force=args.notify)
-                        print(f"Notification sent: {notified}")
-                    except Exception as notify_exc:
-                        print(f"Notification failed: {notify_exc}")
-                raise
-
+            report = await run_daily_collection(
+                db,
+                settings,
+                target_date=target_date,
+                margin_days=args.margin_days,
+                rps=args.rps,
+                process_jobs=not args.skip_jobs,
+                collect_posts_enabled=collect_posts_enabled,
+                collect_stories_enabled=collect_stories_enabled,
+                retry_incomplete=args.retry_incomplete,
+            )
+            if args.export:
+                export_path = export_collected_day(db, settings, target_date)
+                report["export_path"] = str(export_path)
             if not args.no_notify:
-                try:
-                    notified = send_report_notification(report, force=args.notify)
-                    print(f"Notification sent: {notified}")
-                except Exception as notify_exc:
-                    print(f"Notification failed: {notify_exc}")
+                _notify_report(report, force=args.notify)
 
             print(
                 f"Scheduled run done: {report['posts_found']} posts, {report['stories_found']} story files, "
                 f"{report.get('jobs_processed', 0)} jobs processed, {report['profiles_error']} profile errors."
             )
-            return
+            return int(report_has_failure(report))
 
         if args.command in {"process-jobs", "process-comments-queue"}:
             if not settings.collect_comments_default:
@@ -220,7 +246,7 @@ async def _run_async(args: argparse.Namespace) -> None:
                 stats = await processor.process_pending_jobs(args.limit)
                 db.finish_run(
                     run_id,
-                    "success",
+                    stats.run_status,
                     comments_inserted=stats.comments_inserted,
                     replies_inserted=stats.replies_inserted,
                 )
@@ -231,7 +257,7 @@ async def _run_async(args: argparse.Namespace) -> None:
             except Exception as exc:
                 db.finish_run(run_id, "failed", error_message=str(exc))
                 raise
-            return
+            return int(stats.failed > 0)
 
         if args.command == "process-media-queue":
             processor = MediaJobProcessor(db, settings)
@@ -243,6 +269,7 @@ async def _run_async(args: argparse.Namespace) -> None:
                     f"Media jobs processed: {stats.processed}; failed: {stats.failed}; "
                     f"post media downloaded: {stats.post_media_downloaded}; stories saved: {stats.stories_saved}."
                 )
+                return int(stats.failed > 0)
             return
 
         if args.command == "collect-posts":
@@ -258,45 +285,67 @@ async def _run_async(args: argparse.Namespace) -> None:
                 username=args.username,
                 enqueue_comments=not args.no_comments,
                 rps=args.rps,
+                resume=args.resume,
+                retry_failed=args.retry_failed,
             )
-            failed = sum(1 for result in results if result.get("status") == "failed")
-            succeeded = len(results) - failed
-            print(f"Post collection finished: {succeeded} succeeded, {failed} failed.")
-            return
+            return _post_collection_exit_code(results)
 
         if args.command == "collect-stories":
             seed_profiles(db, settings)
-            target_date = parse_iso_date(args.target_date)
-            pool = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
-            collector = GalleryDlStoryCollector(settings)
+            target_date = run_date
+            if not settings.gallery_dl_enabled:
+                print("Story collection is disabled by GALLERY_DL_ENABLED=false.")
+                return
             profiles = [db.get_profile_by_username(args.username.lstrip("@"))] if args.username else db.list_active_profiles()
+            failed = 0
+            if not settings.media_queue_enabled:
+                pool = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
+                collector = GalleryDlStoryCollector(settings)
             for profile in [item for item in profiles if item]:
-                session = pool.next()
-                result = collector.collect_profile_stories(
-                    profile["username"],
-                    target_date,
-                    [session, *pool.alternatives(session)],
-                    candidate_name=str(profile.get("name") or profile["username"]),
-                )
-                stories_saved = 0
-                if result.output_dir:
-                    for story in collector.load_story_metadata(result.output_dir):
-                        story_id, inserted = db.upsert_story(profile["id"], story)
-                        db.store_raw_payload("story", story_id, profile["id"], story.get("raw_json", story))
-                        if inserted:
-                            stories_saved += 1
-                print(
-                    f"@{profile['username']}: {result.status}, {result.files_found} files, "
-                    f"{stories_saved} stories saved, {result.session_alias}"
-                )
-            return
+                try:
+                    if settings.media_queue_enabled:
+                        job_id = db.enqueue_job(
+                            JOB_TYPE_STORIES,
+                            profile_id=profile["id"],
+                            cursor=target_date.isoformat(),
+                            priority=int(profile.get("priority", 0)) + 100,
+                            max_attempts=settings.max_job_attempts,
+                        )
+                        status = f"enqueued story job {job_id}" if job_id else "story job already queued"
+                        print(f"@{profile['username']}: {status}")
+                        continue
+                    session = pool.next()
+                    result = collector.collect_profile_stories(
+                        profile["username"],
+                        target_date,
+                        [session, *pool.alternatives(session)],
+                        candidate_name=str(profile.get("name") or profile["username"]),
+                    )
+                    if result.status == "failed":
+                        failed += 1
+                        print(f"@{profile['username']}: {result.error_message or 'Story collection failed.'}")
+                    stories_saved = 0
+                    if result.output_dir:
+                        for story in collector.load_story_metadata(result.output_dir):
+                            story_id, inserted = db.upsert_story(profile["id"], story)
+                            db.store_raw_payload("story", story_id, profile["id"], story.get("raw_json", story))
+                            if inserted:
+                                stories_saved += 1
+                    print(
+                        f"@{profile['username']}: {result.status}, {result.files_found} files, "
+                        f"{stories_saved} stories saved, {result.session_alias}"
+                    )
+                except Exception as exc:
+                    failed += 1
+                    print(f"@{profile['username']}: story collection failed: {exc}")
+            return int(failed > 0)
 
         if args.command == "collect-profile":
             date_from, date_to = explicit_window(
                 date.fromisoformat(args.date_from),
                 date.fromisoformat(args.date_to),
             )
-            await collect_posts_period(
+            results = await collect_posts_period(
                 db,
                 settings,
                 date_from=date_from,
@@ -305,10 +354,12 @@ async def _run_async(args: argparse.Namespace) -> None:
                 enqueue_comments=args.comments,
                 rps=args.rps,
             )
+            exit_code = _post_collection_exit_code(results)
             if args.comments and settings.collect_comments_default:
                 processor = JobProcessor(db, settings, rps=args.rps)
-                await processor.process_pending_jobs(settings.job_limit_per_run)
-            return
+                stats = await processor.process_pending_jobs(settings.job_limit_per_run)
+                exit_code = int(bool(exit_code or stats.failed))
+            return exit_code
 
         if args.command == "export":
             export_path = export_collected_day(db, settings, date.fromisoformat(args.target_date))
@@ -322,7 +373,9 @@ async def _run_async(args: argparse.Namespace) -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
-    asyncio.run(_run_async(args))
+    exit_code = asyncio.run(_run_async(args))
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

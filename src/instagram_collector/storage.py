@@ -502,6 +502,20 @@ class Database:
         )
         return self._fetchall(sql, (str(date_from), str(date_to)))
 
+    def list_incomplete_profiles_for_posts(self, date_from: Any, date_to: Any, failed_only: bool = False) -> List[Dict[str, Any]]:
+        active = "p.active = TRUE" if self.is_postgres else "p.active = 1"
+        status = "cr.status = 'failed'" if failed_only else "(cr.id IS NULL OR cr.status <> 'success')"
+        # Use the latest attempt, not an older success followed by a failed refresh.
+        return self._fetchall(
+            "SELECT p.* FROM profiles p LEFT JOIN collection_runs cr ON cr.id = ("
+            "SELECT MAX(r.id) FROM collection_runs r WHERE r.profile_id = p.id "
+            "AND r.run_type = 'profile_posts' "
+            f"AND r.date_from = {self.placeholder} AND r.date_to = {self.placeholder}) "
+            f"WHERE {active} AND {status} "
+            "ORDER BY CASE WHEN cr.id IS NULL THEN 1 ELSE 0 END, cr.id DESC, p.priority DESC, p.username",
+            (str(date_from), str(date_to)),
+        )
+
     def get_profile_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         return self._fetchone(
             f"SELECT * FROM profiles WHERE username = {self.placeholder}",
@@ -612,7 +626,7 @@ class Database:
             f"SELECT id, comments_count FROM posts WHERE platform_post_id = {self.placeholder} OR shortcode = {self.placeholder}",
             (str(post["post_id"]), post["shortcode"]),
         )
-        comments_changed = bool(existing and existing.get("comments_count") != post.get("comments_count"))
+        comments_changed = bool(existing and post.get("comments_count") is not None and existing.get("comments_count") != post.get("comments_count"))
         params = (
             profile_id,
             str(post["post_id"]),
@@ -634,8 +648,9 @@ class Database:
         if existing:
             sql = (
                 "UPDATE posts SET profile_id = ?, url = ?, taken_at = ?, taken_at_iso = ?, "
-                "media_type = ?, caption = ?, likes = ?, comments_count = ?, reposts = ?, views = ?, "
-                "is_video = ?, accessibility_caption = ?, raw_json = ?, updated_at = ? WHERE id = ?"
+                "media_type = ?, caption = ?, likes = COALESCE(?, likes), comments_count = COALESCE(?, comments_count), "
+                "reposts = COALESCE(?, reposts), views = COALESCE(?, views), "
+                "is_video = ?, accessibility_caption = COALESCE(?, accessibility_caption), raw_json = ?, updated_at = ? WHERE id = ?"
             )
             update_params = (
                 profile_id,
@@ -987,17 +1002,27 @@ class Database:
         self.conn.commit()
         return int(job_id)
 
-    def fetch_pending_jobs(self, limit: int, job_types: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+    def fetch_pending_jobs(
+        self,
+        limit: int,
+        job_types: Optional[Tuple[str, ...]] = None,
+        exclude_job_ids: Tuple[int, ...] = (),
+    ) -> List[Dict[str, Any]]:
         type_filter = ""
         params: Tuple[Any, ...] = ()
         if job_types:
             placeholders = ", ".join([self.placeholder] * len(job_types))
             type_filter = f"AND job_type IN ({placeholders}) "
             params = tuple(job_types)
+        if exclude_job_ids:
+            placeholders = ", ".join([self.placeholder] * len(exclude_job_ids))
+            type_filter += f"AND id NOT IN ({placeholders}) "
+            params = (*params, *exclude_job_ids)
         sql = (
             "SELECT * FROM collection_jobs "
             f"WHERE status IN ('pending', 'retry') AND attempts < max_attempts {type_filter}"
-            "ORDER BY priority DESC, scheduled_at ASC, id ASC LIMIT ?"
+            "ORDER BY CASE WHEN job_type = 'stories' THEN 0 ELSE 1 END, "
+            "priority DESC, scheduled_at ASC, id ASC LIMIT ?"
         )
         params = (*params, limit)
         if self.is_postgres:

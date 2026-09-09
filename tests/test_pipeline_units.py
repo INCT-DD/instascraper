@@ -7,7 +7,7 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,7 @@ from instagram_collector.jobs import JobProcessor
 from instagram_collector.media_jobs import JOB_TYPE_POST_MEDIA, JOB_TYPE_STORIES
 from instagram_collector.sessions import SessionPool
 from instagram_collector.storage import Database
-from instagram_scraper import AuthError
+from instagram_scraper import AuthError, ScrapeError
 
 
 class DateWindowTests(unittest.TestCase):
@@ -83,6 +83,68 @@ class SessionPoolTests(unittest.TestCase):
 
 
 class ProfileConfigTests(unittest.TestCase):
+    def test_missing_profiles_path_fails_with_configuration_guidance(self) -> None:
+        with TemporaryDirectory() as tmp:
+            for name in ("profiles.json", "candidates.csv", "profiles"):
+                with self.subTest(name=name):
+                    path = Path(tmp) / name
+                    with self.assertRaises(FileNotFoundError) as caught:
+                        load_profiles(str(path))
+                    message = str(caught.exception)
+                    self.assertIn(str(path.resolve()), message)
+                    self.assertIn("PROFILES_PATH", message)
+                    self.assertIn("profile.example.json", message)
+
+    def test_missing_profiles_does_not_seed_fallback_candidates(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db = Mock()
+            settings = SimpleNamespace(profiles_path=str(Path(tmp) / "missing.json"))
+            with self.assertRaises(FileNotFoundError):
+                pipeline_module.seed_profiles(db, settings)
+            db.seed_profiles.assert_not_called()
+
+    def test_load_profiles_accepts_json_and_explicit_empty_list(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profiles.json"
+            path.write_text(json.dumps([{"name": "Teste", "username": "@Teste"}]), encoding="utf-8")
+            profiles = load_profiles(str(path))
+            self.assertEqual([item["username"] for item in profiles], ["teste"])
+            path.write_text("[]", encoding="utf-8")
+            self.assertEqual(load_profiles(str(path)), [])
+
+    def test_load_profiles_accepts_directory_with_json_and_csv(self) -> None:
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "first.json").write_text(
+                json.dumps([{"name": "Primeiro", "username": "primeiro"}]), encoding="utf-8"
+            )
+            (folder / "second.csv").write_text(
+                "Nome;Redes sociais\n;Instagram\nSegundo;https://www.instagram.com/segundo/\n",
+                encoding="utf-8",
+            )
+            profiles = load_profiles(str(folder))
+            self.assertEqual([item["username"] for item in profiles], ["primeiro", "segundo"])
+
+    def test_load_profiles_preserves_csv_names_across_encodings(self) -> None:
+        cases = [
+            ("utf-8", "Candidata \u00c1"),
+            ("utf-8-sig", "Candidata \u00c1"),
+            ("cp1252", "Candidata \u20ac"),
+            ("latin-1", "Candidata \u0081"),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "candidatos.csv"
+            for encoding, name in cases:
+                with self.subTest(encoding=encoding):
+                    text = f"Nome;Redes sociais\n;Instagram\n{name};https://www.instagram.com/teste/\n"
+                    path.write_bytes(text.encode(encoding))
+
+                    profiles = load_profiles(str(path))
+
+                    self.assertEqual(len(profiles), 1)
+                    self.assertEqual(profiles[0]["name"], name)
+                    self.assertEqual(profiles[0]["username"], "teste")
+
     def test_load_profiles_accepts_csv_with_instagram_url(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "candidatos.csv"
@@ -185,6 +247,7 @@ class CommentDisableTests(unittest.IsolatedAsyncioTestCase):
         settings = SimpleNamespace(
             collect_comments_default=False,
             account_rotation_enabled=False,
+            rps=1.0,
         )
 
         with (
@@ -267,6 +330,35 @@ class CollectionJobQueueTests(unittest.TestCase):
 
 
 class JobProcessorRotationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_job_failures_are_recorded_and_queue_continues(self) -> None:
+        for error_type in (AuthError, ScrapeError, ValueError):
+            with self.subTest(error_type=error_type.__name__):
+                db = Database("sqlite:///:memory:")
+                try:
+                    db.init_schema()
+                    db.enqueue_job("comments", None, shortcode="FAIL", cursor="1", max_attempts=1)
+                    db.enqueue_job("comments", None, shortcode="OK", cursor="2")
+                    pool = SessionPool([{"name": "test"}], rotation_enabled=False)
+                    settings = SimpleNamespace(
+                        rps=1.0,
+                        job_limit_per_run=10,
+                        comment_queue_time_limit_seconds=None,
+                    )
+                    processor = JobProcessor(db, settings, session_pool=pool)
+                    with patch.object(
+                        processor,
+                        "_process_job_with_sessions",
+                        new=AsyncMock(side_effect=[error_type("test failure"), {"comments_inserted": 1}]),
+                    ), patch("builtins.print"):
+                        stats = await processor.process_pending_jobs()
+
+                    self.assertEqual(db.count_jobs_by_status(), {"failed": 1, "done": 1})
+                    self.assertEqual(stats.failed, 1)
+                    self.assertEqual(stats.processed, 1)
+                    self.assertEqual(stats.comments_inserted, 1)
+                finally:
+                    db.close()
+
     async def test_job_processing_tries_alternative_session_after_auth_error(self) -> None:
         pool = SessionPool(
             [

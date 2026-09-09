@@ -6,15 +6,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from instagram_scraper import AuthError, ScrapeError
+from instagram_scraper import AuthError, CollectionBlockedError, ProfileAccessError, RateLimiter, ScrapeError
 
 from .config import Settings, load_profiles, load_sessions
 from .files import dated_export_root, ensure_runtime_dirs, write_candidate_archives, write_daily_report, write_profile_posts
 from .gallerydl import GalleryDlStoryCollector
+from .gallerydl_posts import fetch_posts_with_backend
 from .jobs import JobProcessor, JobStats
 from .media_jobs import JOB_TYPE_POST_MEDIA, JOB_TYPE_STORIES
 from .post_media import download_post_media
-from .scraper import InstagramCollector
 from .sessions import CollectorSession, SessionPool
 from .storage import Database
 
@@ -227,6 +227,7 @@ async def _collect_profile_posts_with_sessions(
     output_date: date,
     archive_date_from: date,
     archive_date_to: date,
+    request_limiter: Optional[RateLimiter] = None,
 ) -> PostCollectionAttempt:
     last_error: Optional[Exception] = None
     errors = []
@@ -244,8 +245,13 @@ async def _collect_profile_posts_with_sessions(
                 output_date=output_date,
                 archive_date_from=archive_date_from,
                 archive_date_to=archive_date_to,
+                request_limiter=request_limiter,
             )
             return PostCollectionAttempt(stats=stats, session_alias=candidate.alias, errors=errors)
+        except ProfileAccessError as exc:
+            return PostCollectionAttempt(stats=None, session_alias=candidate.alias, errors=[str(exc)])
+        except CollectionBlockedError:
+            raise
         except Exception as exc:
             last_error = exc
             errors.append(f"{candidate.alias}: {exc}")
@@ -352,7 +358,7 @@ async def _process_daily_jobs(
         stats: JobStats = await processor.process_pending_jobs(settings.job_limit_per_run)
         db.finish_run(
             run_id,
-            "success",
+            stats.run_status,
             comments_inserted=stats.comments_inserted,
             replies_inserted=stats.replies_inserted,
         )
@@ -377,6 +383,7 @@ async def collect_profile(
     output_date: Optional[date] = None,
     archive_date_from: Optional[date] = None,
     archive_date_to: Optional[date] = None,
+    request_limiter: Optional[RateLimiter] = None,
 ) -> ProfileCollectionStats:
     profile = db.get_profile_by_username(username)
     if not profile:
@@ -389,8 +396,11 @@ async def collect_profile(
     print(f"Collecting @{username} from {date_from.date()} to {date_to.date()} using {session_alias}...")
 
     try:
-        async with InstagramCollector(cookie_path, rps or settings.rps) as scraper:
-            posts = await scraper.fetch_profile_posts(username, date_from, date_to)
+        collector_session = session or CollectorSession("default", cookie_path, "")
+        posts = await fetch_posts_with_backend(
+            settings, collector_session, username, date_from, date_to,
+            rps if rps is not None else settings.rps, limiter=request_limiter,
+        )
 
         export_date_from = archive_date_from or date_from.date()
         export_date_to = archive_date_to or date_to.date()
@@ -516,6 +526,7 @@ async def run_daily_collection(
     daily_run_id = db.start_run(None, "daily", date_from, date_to)
     sessions = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
     story_collector = GalleryDlStoryCollector(settings)
+    request_limiter = RateLimiter(rps if rps is not None else settings.rps) if collect_posts_enabled else None
     report = _new_daily_report(target_date, started_at, date_from, date_to, settings.timezone, len(profiles))
     mode = "incomplete profiles" if retry_incomplete else "profiles"
     print(f"Starting daily collection for {len(profiles)} {mode}.")
@@ -538,6 +549,7 @@ async def run_daily_collection(
                     output_date=target_date,
                     archive_date_from=target_date,
                     archive_date_to=target_date,
+                    request_limiter=request_limiter,
                 )
                 profile_result["errors"].extend(attempt.errors)
                 if attempt.session_alias:
@@ -564,6 +576,15 @@ async def run_daily_collection(
                     )
 
             _apply_profile_status(report, profile_result, collect_posts_enabled, collect_stories_enabled)
+        except CollectionBlockedError as exc:
+            profile_result["status"] = "failed"
+            profile_result["errors"].append(str(exc))
+            report["profiles_error"] += 1
+            report["errors"].append({"username": profile["username"], "stage": "collection_blocked", "error": str(exc)})
+            _record_profile_result(db, daily_run_id, profile, profile_result)
+            report["profile_results"].append(profile_result)
+            print("Collection stopped: Instagram restricted the session. Remaining profiles were not attempted.")
+            return _finish_daily_run(db, settings, daily_run_id, target_date, started_at, report)
         except Exception as exc:
             profile_result["status"] = "failed"
             profile_result["errors"].append(str(exc))
@@ -587,12 +608,22 @@ async def collect_posts_period(
     username: Optional[str] = None,
     enqueue_comments: bool = True,
     rps: Optional[float] = None,
+    resume: bool = False,
+    retry_failed: bool = False,
 ) -> List[Dict[str, Any]]:
+    if resume and retry_failed:
+        raise ValueError("Use either resume or retry_failed, not both.")
     seed_profiles(db, settings)
     sessions = SessionPool(load_sessions(settings), settings.account_rotation_enabled)
     profiles = [db.get_profile_by_username(username.lstrip("@"))] if username else db.list_active_profiles()
+    if resume or retry_failed:
+        incomplete = db.list_incomplete_profiles_for_posts(date_from, date_to, failed_only=retry_failed)
+        profiles = [p for p in incomplete if not username or p["username"] == username.lstrip("@")]
+        mode = "failed" if retry_failed else "incomplete"
+        print(f"Resuming posts: {len(profiles)} {mode} profiles for the exact date range.")
     results = []
     enqueue_comments = enqueue_comments and settings.collect_comments_default
+    request_limiter = RateLimiter(rps if rps is not None else settings.rps)
     for profile in [item for item in profiles if item]:
         session = sessions.next()
         attempt = await _collect_profile_posts_with_sessions(
@@ -608,6 +639,7 @@ async def collect_posts_period(
             output_date=date_to.date(),
             archive_date_from=date_from.date(),
             archive_date_to=date_to.date(),
+            request_limiter=request_limiter,
         )
         if attempt.stats is None:
             results.append(

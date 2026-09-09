@@ -21,7 +21,9 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from math import ceil
+from email.utils import parsedate_to_datetime
+from http.cookies import SimpleCookie
+from math import ceil, isfinite
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
@@ -53,6 +55,14 @@ class ScrapeError(Exception):
 
 class AuthError(ScrapeError):
     pass
+
+
+class CollectionBlockedError(AuthError):
+    """Stop collection when Instagram explicitly restricts the session."""
+
+
+class ProfileAccessError(AuthError):
+    """Record a refused profile request without retrying another backend/session."""
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +123,16 @@ def build_headers(referer: str, cookie_str: str) -> Dict[str, str]:
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
         "X-Requested-With": "XMLHttpRequest",
         "X-IG-App-ID": "936619743392459",
-        "X-CSRFToken": "",
+        "X-CSRFToken": _cookie_value(cookie_str, "csrftoken"),
         "Referer": referer,
         "Cookie": cookie_str,
     }
+
+
+def _cookie_value(cookie_str: str, name: str) -> str:
+    cookies = SimpleCookie()
+    cookies.load(cookie_str)
+    return cookies[name].value if name in cookies else ""
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +141,9 @@ def build_headers(referer: str, cookie_str: str) -> Dict[str, str]:
 
 class RateLimiter:
     def __init__(self, rps: float):
-        self.interval = 1.0 / max(0.1, rps)
+        if not isfinite(rps) or rps <= 0:
+            raise ValueError("RPS must be a finite number greater than zero.")
+        self.interval = 1.0 / rps
         self._last = 0.0
         self._lock = asyncio.Lock()
 
@@ -188,15 +206,47 @@ async def graphql_get(
 # Buscar posts do perfil
 # ---------------------------------------------------------------------------
 
+async def _profile_lookup_get(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    limiter: Optional[RateLimiter],
+    params: Optional[Dict[str, str]] = None,
+) -> httpx.Response:
+    for attempt in range(3):
+        if limiter is not None:
+            await limiter.wait()
+        response = await client.get(url, params=params, headers=headers, timeout=15, follow_redirects=False)
+        if response.status_code != 429:
+            return response
+        if attempt == 2:
+            break
+        retry_after = response.headers.get("retry-after", "60")
+        try:
+            delay = float(retry_after)
+            if not isfinite(delay) or delay < 0:
+                delay = 60.0
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                delay = 60.0
+        tqdm.write(f"  Rate limit (429) ao buscar perfil. Aguardando {delay:g}s...")
+        await asyncio.sleep(delay)
+    raise CollectionBlockedError("Limite de requisicoes (HTTP 429) ao buscar perfil apos 3 tentativas; coleta interrompida.")
+
+
 async def fetch_user_id(
     client: httpx.AsyncClient,
     username: str,
     cookie_str: str,
+    limiter: Optional[RateLimiter] = None,
 ) -> str:
     """Obtém o user_id numérico a partir do username."""
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     headers = build_headers(f"https://www.instagram.com/{username}/", cookie_str)
-    r = await client.get(url, headers=headers, timeout=15, follow_redirects=False)
+    r = await _profile_lookup_get(client, url, headers, limiter)
     _raise_for_instagram_redirect(r, "web_profile_info")
     if r.status_code == 200:
         data = r.json()
@@ -205,7 +255,7 @@ async def fetch_user_id(
         except (KeyError, TypeError):
             pass
 
-    return await fetch_user_id_from_search(client, username, cookie_str, r.status_code)
+    return await fetch_user_id_from_search(client, username, cookie_str, r.status_code, limiter=limiter)
 
 
 async def fetch_user_id_from_search(
@@ -213,6 +263,7 @@ async def fetch_user_id_from_search(
     username: str,
     cookie_str: str,
     previous_status: Optional[int] = None,
+    limiter: Optional[RateLimiter] = None,
 ) -> str:
     """
     Fallback para perfis em que /web_profile_info/ quebra por campos de categoria
@@ -220,13 +271,7 @@ async def fetch_user_id_from_search(
     """
     url = "https://www.instagram.com/web/search/topsearch/"
     headers = build_headers("https://www.instagram.com/", cookie_str)
-    r = await client.get(
-        url,
-        params={"query": username},
-        headers=headers,
-        timeout=15,
-        follow_redirects=False,
-    )
+    r = await _profile_lookup_get(client, url, headers, limiter, params={"query": username})
     _raise_for_instagram_redirect(r, "topsearch")
     if r.status_code != 200:
         detail = f"HTTP {previous_status}" if previous_status else "estrutura inesperada"
@@ -340,7 +385,8 @@ def _raise_for_instagram_redirect(response: httpx.Response, context: str) -> Non
     if "login" in location_lower or location in {"", "/"} or location.startswith("https://www.instagram.com/"):
         raise AuthError(
             f"Instagram redirecionou {context} para {location or 'outra pagina'}; "
-            "cookies invalidos, expirados ou conta em verificacao."
+            "acesso ao endpoint recusado. Verifique a sessao e eventuais restricoes da conta; "
+            "o redirecionamento sozinho nao comprova que os cookies expiraram."
         )
     raise AuthError(f"Instagram redirecionou {context} para {location}; atualize/verifique os cookies.")
 
@@ -687,7 +733,7 @@ async def scrape_profile(
 
         # 1. Obtém user_id
         print(f"\nBuscando user_id de @{username}...")
-        user_id = await fetch_user_id(client, username, cookie_str)
+        user_id = await fetch_user_id(client, username, cookie_str, limiter=limiter)
         print(f"  → user_id: {user_id}")
 
         # 2. Coleta posts no intervalo de datas
