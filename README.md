@@ -4,6 +4,22 @@ Pipeline de coleta academica para monitoramento de perfis publicos do Instagram.
 
 O objetivo principal e permitir coleta recorrente e auditavel de metadados publicos para pesquisa. O codigo privilegia funcionamento leve, previsibilidade operacional e rastreabilidade dos dados coletados.
 
+## Retomar uma coleta de posts interrompida
+
+Depois de a execucao anterior encerrar e de resolver eventuais restricoes da sessao, repita o comando com as mesmas datas e `--resume`:
+
+```bash
+docker compose run --rm app python -m pipeline collect-posts --start-date 2026-09-01 --end-date 2026-09-08 --no-comments --rps 0.03 --resume
+```
+
+A retomada utiliza `collection_runs`, inclusive registros anteriores a esta funcionalidade, sem migration. Para cada perfil ativo e intervalo exato, consulta a ultima tentativa `profile_posts`: sucessos, inclusive coletas vazias, sao ignorados; tentativas incompletas sao refeitas desde a primeira pagina. Comeca pela tentativa incompleta mais recente, depois outras incompletas e perfis ainda nao tentados. Um sucesso antigo nao esconde uma falha posterior. `--username` restringe a selecao ao perfil indicado.
+
+Para repetir somente erros, use `--retry-failed` no lugar de `--resume`. Ele seleciona apenas perfis ativos cuja ultima tentativa `profile_posts` no intervalo exato esta como `failed`; exclui sucessos, perfis nunca tentados e registros `running`. As duas opcoes sao mutuamente exclusivas. Um erro antigo seguido de sucesso nao sera repetido.
+
+Sem essas opcoes, o comando continua atualizando todos os perfis selecionados. A retomada nao compara outros parametros: mantenha as mesmas opcoes de comentarios, midias e exportacao; para mudar o escopo ou atualizar metricas ja coletadas, execute sem filtros de retomada. Datas diferentes representam outro intervalo. A conclusao do perfil significa metadados persistidos e jobs enfileirados, nao necessariamente downloads concluidos. Estes filtros nao resetam a fila de midias.
+
+Nao execute a retomada em paralelo com outra coleta do mesmo periodo: registros `running` tambem sao considerados incompletos, pois podem vir de um processo interrompido. Nao ha reinicio automatico diante de bloqueio, nem retomada de cursor de pagina. O worker de midias permanece independente.
+
 ## Sumario
 
 - [Visao geral](#visao-geral)
@@ -283,13 +299,33 @@ Para remover de fato comentarios, replies, jobs de comentarios, registros de sto
 docker compose run --rm app python -m pipeline cleanup-secondary-data --comments --stories --story-media-files --confirm
 ```
 
-Posts ja coletados sao preservados.
+Posts ja coletados sao preservados. A opcao `--story-media-files` procura `data/raw/stories` e as subpastas `<candidato>/stories` na raiz `STORY_MEDIA_DIR` e nas respectivas pastas datadas, inclusive por periodo. O dry-run lista os caminhos que seriam excluidos. Pastas de midias de posts e arquivos JSON dos candidatos sao preservados; links simbolicos para diretorios externos nao sao percorridos.
 
 ## Coleta de Posts em Detalhe
 
 A coleta de posts foi desenhada para monitorar perfis publicos definidos na base de dados, respeitando um intervalo de datas e mantendo rastreabilidade do que foi retornado pelo Instagram. Ela nao usa a API oficial da Meta. A v0 trabalha com endpoints web/privados do Instagram, autenticados por cookies de contas coletoras.
 
 ### Entrada da coleta
+
+O backend de posts e selecionado por `POSTS_BACKEND`: `auto` (padrao) tenta a timeline GraphQL, depois o scraper REST e o gallery-dl diante de erro de contrato/HTTP. `graphql`, `scraper` e `gallery-dl` selecionam somente o respectivo backend. Uma coleta valida sem posts nao dispara fallback, nem erros de persistencia no banco ou disco. HTTP 401/403 na timeline registra falha do perfil e segue para o proximo, sem fallback ou tentativa em outra conta para aquele perfil. Isso nao comprova que a recusa seja exclusiva do perfil: se a sessao estiver invalida, os seguintes tambem podem falhar. A coleta termina com codigo de erro quando houver falhas, mesmo tendo continuado. HTTP 429, redirecionamento e feedback/challenge/checkpoint ainda interrompem a execucao sem tentar outro backend ou outra conta.
+
+A timeline usa `POST https://www.instagram.com/graphql/query`, com o username e `INSTAGRAM_TIMELINE_DOC_ID` (padrao `7898261790222653`). O header `X-CSRFToken` recebe o token do cookie. A variavel `__relay_internal__pv__PolarisFeedShareMenurelayprovider=false` faz parte do contrato dessa consulta. O identificador pode mudar no Instagram e deve ser atualizado somente apos validar resposta e paginacao.
+
+Os itens de `data.xdt_api__v1__feed__user_timeline_graphql_connection.edges[].node` passam pelo normalizador existente. Identidade, data, legenda, metricas e URLs de fotos/videos/carrosseis seguem para o mesmo banco e fila de midias. `raw_json` conserva o node completo e `_collector` identifica backend, API e doc_id. Reposts nao vieram no teste dessa timeline; nenhum detalhe adicional e consultado automaticamente para obter a metrica.
+
+O adaptador captura o payload REST antes do parser de metadados do gallery-dl para preservar comentarios, reposts, visualizacoes e acessibilidade quando disponiveis. O JSON padrao de download nao conserva todos esses campos. `raw_json` recebe o item completo, mais `_collector` com backend, API e versao. As midias seguem para `post_media` e para a fila existente (ou download direto se ela estiver desabilitada); o downloader HTTP da pipeline continua salvando os arquivos. Stories conservam prioridade na fila.
+
+Metricas ausentes ficam `NULL` nos posts novos. Em posts existentes, a resposta que omite uma metrica preserva seu valor anterior; zero explicito continua atualizando para zero. Consulte `raw_json` para distinguir uma nova medicao de um valor preservado. Nao ha nova migration.
+
+Teste de um perfil com GraphQL:
+
+```powershell
+docker compose run --rm -e POSTS_BACKEND=graphql app python -m pipeline collect-posts --username abmarinho --start-date 2026-09-01 --end-date 2026-09-06 --no-comments --rps 0.03
+```
+
+Posts usam a biblioteca gallery-dl no mesmo Python da pipeline, em subprocesso isolado; `GALLERY_DL_BINARY` continua se aplicando a stories. `GALLERY_DL_TIMEOUT_SECONDS` limita a extracao por perfil e `GALLERY_DL_SLEEP_REQUEST` define sua pausa, respeitando tambem o intervalo minimo de `--rps`. Processos distintos nao compartilham o limitador.
+
+O gallery-dl REST usa a mesma rota de feed do scraper: o fallback nao garante acesso quando essa rota esta restrita. No teste documentado, o detalhe de um post funcionou, mas a listagem falhou nos dois clientes. Veja a [comparacao dos endpoints e campos do banco](docs/gallery-dl-posts.md).
 
 O ponto de partida e a lista de perfis ativos. Normalmente essa lista vem de `profiles.json` e e sincronizada para a tabela `profiles` pelo comando:
 
@@ -318,9 +354,9 @@ Para posts, o arquivo principal de cookie e o JSON indicado em `instagram_cookie
 
 Esses cookies sao usados para montar as requisicoes HTTP ao Instagram. A conta nao precisa ficar aberta no navegador do servidor depois que os cookies foram exportados, mas os cookies precisam continuar validos. Se a conta for deslogada em todos os dispositivos, se trocar senha, se houver challenge, bloqueio ou expiracao de sessao, o cookie pode deixar de funcionar e deve ser renovado.
 
-### Resolucao do `user_id`
+### Resolucao do `user_id` no REST
 
-O Instagram pagina posts pelo identificador numerico do perfil, nao apenas pelo `username`. Por isso, antes de buscar o feed, o scraper tenta resolver o `user_id`.
+O backend GraphQL usa o username diretamente e dispensa a resolucao de ID. O backend REST pagina posts pelo identificador numerico do perfil; antes de buscar esse feed, o scraper tenta resolver o `user_id`.
 
 Primeiro ele consulta:
 
@@ -338,7 +374,9 @@ O fallback procura o perfil pelo username e extrai o `pk`/`user_id` do resultado
 
 ### Paginacao do feed
 
-Com o `user_id` resolvido, a coleta busca paginas do feed do perfil por:
+A timeline GraphQL retorna paginas de 12 posts, com `page_info.has_next_page` e `end_cursor`. O cursor e enviado em `after`, junto de `first=12`, `before=null` e `last=null`. A pipeline elimina duplicatas por ID, ignora fixados antigos ao decidir o fim do periodo e rejeita cursores repetidos ou respostas incompletas. Uma resposta HTTP 200 sem a conexao esperada e erro de contrato, nunca uma coleta vazia bem-sucedida. Se uma pagina falhar, o perfil nao e anunciado como completamente coletado.
+
+No backend REST, com o `user_id` resolvido, a coleta busca paginas por:
 
 ```text
 /api/v1/feed/user/{user_id}/?count=12
@@ -350,7 +388,7 @@ Cada pagina retorna uma lista de itens e, quando existem mais itens disponiveis,
 - ainda existirem posts dentro ou possivelmente dentro do periodo solicitado;
 - nao ocorrer uma falha de autenticacao, bloqueio ou limite de requisicoes.
 
-O parametro `--rps` controla a velocidade das requisicoes. Por exemplo, `--rps 0.5` significa aproximadamente uma requisicao a cada dois segundos. Para monitoramento academico recorrente, valores baixos sao preferiveis porque reduzem chance de bloqueio e tornam a coleta mais estavel.
+O parametro `--rps` controla o intervalo das requisicoes do coletor: `--rps 0.5` corresponde a dois segundos e `--rps 0.03` a aproximadamente 33,3 segundos. Valores devem ser finitos e maiores que zero. GraphQL e REST compartilham o limitador entre paginas e perfis da mesma execucao. Na timeline GraphQL, 429 e restricoes explicitas encerram a coleta imediatamente; `Retry-After`, quando presente, aparece no erro. No lookup REST, 429 aguarda `Retry-After` (ou 60 segundos quando ausente/invalido) entre ate tres tentativas, sem pausa apos a ultima. Ao esgotar essas tentativas, a coleta termina. O comando sai com erro, e a execucao diaria gera relatorio parcial; perfis restantes nao sao marcados como sucesso. A interrupcao vale para essa execucao: nao ha cooldown persistido nem coordenacao com workers/processos independentes. Os downloads via `gallery-dl` usam suas proprias configuracoes de espera. Reduzir a frequencia nao garante ausencia de bloqueios.
 
 ### Filtro por periodo
 
@@ -433,12 +471,33 @@ Alguns erros nao significam necessariamente perda da coleta:
 | `run-daily` | Executa a coleta diaria de perfis ativos. |
 | `run-scheduled` | Executa a coleta diaria com comportamento voltado para cron: pode exportar e notificar falhas. |
 | `collect-posts` | Coleta posts por periodo, com opcao de filtrar por perfil. |
-| `collect-stories` | Coleta stories disponiveis no momento da execucao. |
+| `collect-stories` | Enfileira stories com `MEDIA_QUEUE_ENABLED=true`; caso contrario, coleta diretamente com `gallery-dl`. |
 | `process-media-queue` | Processa a fila pendente de downloads de midias de posts e stories. Com `--watch`, fica rodando continuamente. |
 | `process-comments-queue` | Processa a fila pendente de comentarios/replies. |
 | `process-jobs` | Alias operacional para processamento da fila. |
 | `export` | Gera exportacao do dia em pasta propria. |
 | `collect-profile` | Alias de compatibilidade para coleta de perfil especifico. |
+
+Quando `--date` e omitida nos comandos que aceitam uma data opcional, o dia atual e calculado usando `TIMEZONE`. Uma data explicita e preservada.
+
+### Prioridade da fila de midias
+
+Com `MEDIA_QUEUE_ENABLED=true`, `collect-stories` e a coleta diaria criam jobs para o worker. O enfileiramento nao significa que os arquivos ja foram baixados. Mantenha o worker ativo:
+
+```powershell
+docker compose up -d media-worker
+docker compose logs -f media-worker
+```
+
+O worker seleciona stories pendentes antes das midias de posts, independentemente da prioridade numerica do perfil. Dentro de cada tipo, permanece a ordem por prioridade, agendamento e identificador. A selecao e refeita depois de cada job: um story que chega durante o processamento passa a frente dos posts restantes. O job em andamento termina normalmente, inclusive os arquivos de um carrossel.
+
+Cada job pode ser tentado uma vez por ciclo; as retentativas continuam sujeitas ao numero maximo de tentativas. `--limit` define o tamanho do ciclo, e `--watch` repete os ciclos com a pausa de `--sleep`. `--skip-jobs` afeta apenas o processamento de comentarios/replies na coleta diaria, sem pausar o worker de midias. Stories precisam continuar disponiveis no Instagram quando o worker executar o download.
+
+### Resultado dos comandos
+
+Comandos de coleta e processamento pontual retornam codigo de saida `1` quando identificam falhas ou resultados parciais, e `0` quando concluem sem essas falhas. Erros de argumentos retornam `2`. O resumo de posts distingue perfis com sucesso, resultado parcial e falha. Runs de comentarios tambem registram `partial` ou `failed` conforme o resultado dos jobs.
+
+No modo continuo `process-media-queue --watch`, uma falha de download e registrada e o worker continua processando a fila. O resultado da coleta de metadados nao comprova a conclusao dos downloads assincronos; acompanhe tambem os logs e os status dos jobs de midia.
 
 Ajuda dos comandos:
 
@@ -476,6 +535,8 @@ Variaveis importantes:
 | `COLLECT_STORIES_DEFAULT` | Ativa stories por padrao. Para o modo eleitoral com stories, use `true`. |
 | `COLLECT_COMMENTS_DEFAULT` | Ativa enfileiramento de comentarios por padrao. Para o modo eleitoral, use `false`. |
 | `COLLECT_POST_MEDIA` | Baixa midias dos posts quando disponiveis no payload. |
+| `POSTS_BACKEND` | `auto`: GraphQL, REST e gallery-dl; `graphql`, `scraper` ou `gallery-dl`: somente o backend escolhido. Bloqueios explicitos interrompem a coleta. |
+| `INSTAGRAM_TIMELINE_DOC_ID` | Identificador da timeline GraphQL. Padrao validado: `7898261790222653`. |
 | `MEDIA_QUEUE_ENABLED` | Quando `true`, posts e stories criam jobs de midia; o `media-worker` baixa sem travar a coleta. |
 | `MEDIA_QUEUE_LIMIT` | Quantidade maxima de jobs de midia processados por ciclo do worker. |
 | `MEDIA_WORKER_SLEEP_SECONDS` | Intervalo de espera entre ciclos do `media-worker`. |
@@ -881,7 +942,7 @@ Relatorio diario:
 reports/YYYY-MM-DD.json
 ```
 
-O comando `run-scheduled` pode enviar notificacoes quando houver falha ou execucao parcial.
+O comando `run-scheduled` pode enviar notificacoes quando houver falha ou execucao parcial. A tentativa de notificacao tambem cobre erros na leitura de configuracao, conexao com o banco, preparacao do schema e inicializacao dos logs. O envio depende de uma configuracao de notificacao valida e da disponibilidade do provedor. `--no-notify` desativa o envio; uma falha ao enviar a notificacao nao oculta o erro original da coleta.
 
 ### Telegram
 
@@ -1067,6 +1128,11 @@ Possibilidades:
 - `gallery-dl` nao instalado na imagem/ambiente.
 
 ### `profiles.json` ausente
+
+Se o caminho definido em `PROFILES_PATH` nao existir, a coleta encerra com
+`FileNotFoundError`, indicando o caminho e como configurar a lista. Nao existe
+lista de perfis embutida como fallback. JSON, CSV e diretorios existentes
+continuam sendo aceitos.
 
 Crie a partir do exemplo:
 
