@@ -13,6 +13,7 @@ cookies/
 profiles.json
 
 # Runtime output
+*.dump
 collector.db
 data/
 logs/
