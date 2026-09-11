@@ -18,7 +18,7 @@ Para repetir somente erros, use `--retry-failed` no lugar de `--resume`. Ele sel
 
 Sem essas opcoes, o comando continua atualizando todos os perfis selecionados. A retomada nao compara outros parametros: mantenha as mesmas opcoes de comentarios, midias e exportacao; para mudar o escopo ou atualizar metricas ja coletadas, execute sem filtros de retomada. Datas diferentes representam outro intervalo. A conclusao do perfil significa metadados persistidos e jobs enfileirados, nao necessariamente downloads concluidos. Estes filtros nao resetam a fila de midias.
 
-Nao execute a retomada em paralelo com outra coleta do mesmo periodo: registros `running` tambem sao considerados incompletos, pois podem vir de um processo interrompido. Nao ha reinicio automatico diante de bloqueio, nem retomada de cursor de pagina. O worker de midias permanece independente.
+Nao execute a retomada em paralelo com outra coleta do mesmo periodo: registros `running` tambem sao considerados incompletos, pois podem vir de um processo interrompido. Rate limits recebem repeticao limitada do perfil na mesma execucao; nao ha reinicio automatico do processo apos desligamento, nem retomada de cursor de pagina. O worker de midias permanece independente.
 
 ## Sumario
 
@@ -307,7 +307,7 @@ A coleta de posts foi desenhada para monitorar perfis publicos definidos na base
 
 ### Entrada da coleta
 
-O backend de posts e selecionado por `POSTS_BACKEND`: `auto` (padrao) tenta a timeline GraphQL, depois o scraper REST e o gallery-dl diante de erro de contrato/HTTP. `graphql`, `scraper` e `gallery-dl` selecionam somente o respectivo backend. Uma coleta valida sem posts nao dispara fallback, nem erros de persistencia no banco ou disco. HTTP 401/403 na timeline registra falha do perfil e segue para o proximo, sem fallback ou tentativa em outra conta para aquele perfil. Isso nao comprova que a recusa seja exclusiva do perfil: se a sessao estiver invalida, os seguintes tambem podem falhar. A coleta termina com codigo de erro quando houver falhas, mesmo tendo continuado. HTTP 429, redirecionamento e feedback/challenge/checkpoint ainda interrompem a execucao sem tentar outro backend ou outra conta.
+O backend de posts e selecionado por `POSTS_BACKEND`: `auto` (padrao) tenta a timeline GraphQL, depois o scraper REST e o gallery-dl diante de erro de contrato/HTTP. `graphql`, `scraper` e `gallery-dl` selecionam somente o respectivo backend. Uma coleta valida sem posts nao dispara fallback, nem erros de persistencia no banco ou disco. HTTP 401/403 na timeline registra falha do perfil e segue para o proximo, sem fallback ou tentativa em outra conta para aquele perfil. HTTP 429 recebe espera e repeticao limitada na mesma conta; se persistir, o perfil fica como falha e os demais sao consultados. Redirecionamentos e feedback/challenge/checkpoint recebem uma espera, sem repeticao automatica daquele perfil. Essas respostas nao provocam mais encerramento antecipado do lote nem troca de backend/conta para contornar a restricao. Se a sessao estiver invalida, os seguintes tambem podem falhar. A coleta termina com codigo de erro quando houver falhas, mesmo tendo percorrido todos os perfis.
 
 A timeline usa `POST https://www.instagram.com/graphql/query`, com o username e `INSTAGRAM_TIMELINE_DOC_ID` (padrao `7898261790222653`). O header `X-CSRFToken` recebe o token do cookie. A variavel `__relay_internal__pv__PolarisFeedShareMenurelayprovider=false` faz parte do contrato dessa consulta. O identificador pode mudar no Instagram e deve ser atualizado somente apos validar resposta e paginacao.
 
@@ -388,7 +388,13 @@ Cada pagina retorna uma lista de itens e, quando existem mais itens disponiveis,
 - ainda existirem posts dentro ou possivelmente dentro do periodo solicitado;
 - nao ocorrer uma falha de autenticacao, bloqueio ou limite de requisicoes.
 
-O parametro `--rps` controla o intervalo das requisicoes do coletor: `--rps 0.5` corresponde a dois segundos e `--rps 0.03` a aproximadamente 33,3 segundos. Valores devem ser finitos e maiores que zero. GraphQL e REST compartilham o limitador entre paginas e perfis da mesma execucao. Na timeline GraphQL, 429 e restricoes explicitas encerram a coleta imediatamente; `Retry-After`, quando presente, aparece no erro. No lookup REST, 429 aguarda `Retry-After` (ou 60 segundos quando ausente/invalido) entre ate tres tentativas, sem pausa apos a ultima. Ao esgotar essas tentativas, a coleta termina. O comando sai com erro, e a execucao diaria gera relatorio parcial; perfis restantes nao sao marcados como sucesso. A interrupcao vale para essa execucao: nao ha cooldown persistido nem coordenacao com workers/processos independentes. Os downloads via `gallery-dl` usam suas proprias configuracoes de espera. Reduzir a frequencia nao garante ausencia de bloqueios.
+O parametro `--rps` controla o intervalo das requisicoes do coletor: `--rps 0.5` corresponde a dois segundos e `--rps 0.03` a aproximadamente 33,3 segundos. Valores devem ser finitos e maiores que zero. GraphQL e REST compartilham o limitador entre paginas e perfis da mesma execucao. No lookup e feed REST existem ate tres tentativas de pagina, com `Retry-After` ou 60 segundos entre elas. Ao esgotar, o erro tipado chega a politica de repeticao do perfil, tambem usada pelo GraphQL e pelo fallback gallery-dl.
+
+Por padrao, `PROFILE_BLOCK_WAIT_SECONDS=0` desativa a espera adicional apos falha do perfil e a repeticao automatica do perfil, inclusive apos 429. A coleta registra o erro e segue, respeitando o `--rps`. As tentativas internas dos adaptadores REST/gallery-dl ainda possuem suas proprias esperas. Os perfis falhados permanecem no banco e no resumo; a diaria termina como parcial se necessario.
+
+Opcionalmente, um valor positivo em `PROFILE_BLOCK_WAIT_SECONDS` reativa a politica de espera e `PROFILE_RATE_LIMIT_RETRIES=1` permite uma repeticao do perfil apos 429. Nesse modo, a espera dobra por tentativa e um `Retry-After` maior prevalece. Outros bloqueios recebem espera sem repetir o perfil. Cada tentativa fica no historico e uma recuperacao concluida substitui a falha como ultima tentativa para `--resume`/`--retry-failed`.
+
+As esperas valem para a execucao atual, sem cooldown persistido nem coordenacao com workers/processos independentes. Downloads via `gallery-dl` possuem suas proprias esperas. Ctrl+C continua permitido. Falhas anteriores a selecao dos perfis, indisponibilidade do banco, falta de disco ou encerramento da maquina ainda podem impedir concluir ou registrar o lote. Esta politica nao garante dados indisponiveis no Instagram nem conclusao dentro de um prazo fixo.
 
 ### Filtro por periodo
 
@@ -535,8 +541,10 @@ Variaveis importantes:
 | `COLLECT_STORIES_DEFAULT` | Ativa stories por padrao. Para o modo eleitoral com stories, use `true`. |
 | `COLLECT_COMMENTS_DEFAULT` | Ativa enfileiramento de comentarios por padrao. Para o modo eleitoral, use `false`. |
 | `COLLECT_POST_MEDIA` | Baixa midias dos posts quando disponiveis no payload. |
-| `POSTS_BACKEND` | `auto`: GraphQL, REST e gallery-dl; `graphql`, `scraper` ou `gallery-dl`: somente o backend escolhido. Bloqueios explicitos interrompem a coleta. |
+| `POSTS_BACKEND` | `auto`: GraphQL, REST e gallery-dl; `graphql`, `scraper` ou `gallery-dl`: somente o backend escolhido. Bloqueios recebem espera e registro de falha sem encerrar o lote. |
 | `INSTAGRAM_TIMELINE_DOC_ID` | Identificador da timeline GraphQL. Padrao validado: `7898261790222653`. |
+| `PROFILE_RATE_LIMIT_RETRIES` | Repeticoes adicionais do perfil apos 429, na mesma sessao. Padrao `1`; aceita de `0` a `5`. |
+| `PROFILE_BLOCK_WAIT_SECONDS` | Padrao `0`: sem espera adicional nem repeticao do perfil apos bloqueio. Valor positivo reativa a espera e as repeticoes de 429. |
 | `MEDIA_QUEUE_ENABLED` | Quando `true`, posts e stories criam jobs de midia; o `media-worker` baixa sem travar a coleta. |
 | `MEDIA_QUEUE_LIMIT` | Quantidade maxima de jobs de midia processados por ciclo do worker. |
 | `MEDIA_WORKER_SLEEP_SECONDS` | Intervalo de espera entre ciclos do `media-worker`. |
