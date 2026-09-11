@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List
 
 import httpx
 
-from instagram_scraper import CollectionBlockedError, ProfileAccessError, RateLimiter, ScrapeError, _first_int, _normalize_v1_item, parse_post_metadata
+from instagram_scraper import CollectionBlockedError, ProfileAccessError, RateLimitError, RateLimiter, ScrapeError, _first_int, _normalize_v1_item, parse_post_metadata
 
 from .config import Settings
 from .gallerydl import GalleryDlStoryCollector
@@ -134,6 +134,8 @@ async def fetch_gallery_posts(
     if process.returncode:
         error = stderr.decode("utf-8", errors="replace").strip()[-1500:]
         error = re.sub(r"https?://\S+", "[Instagram endpoint]", error)
+        if re.search(r"Too Many Requests|\b429\b", error, re.IGNORECASE):
+            raise RateLimitError(f"gallery-dl posts rate limited the session: {error}")
         if re.search(r"feedback_required|challenge_required|checkpoint_required|login_required|AuthRequired|Too Many Requests|\b429\b", error, re.IGNORECASE):
             raise CollectionBlockedError(f"gallery-dl posts restricted the session: {error}")
         raise ScrapeError(f"gallery-dl posts failed: {error or 'extractor process failed'}")

@@ -58,7 +58,27 @@ class AuthError(ScrapeError):
 
 
 class CollectionBlockedError(AuthError):
-    """Stop collection when Instagram explicitly restricts the session."""
+    """Instagram explicitly restricted a request; do not switch backends."""
+
+
+class RateLimitError(CollectionBlockedError):
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(value: Optional[str], default: float = 60.0) -> float:
+    if value is None:
+        return default
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return default
+    return delay if isfinite(delay) and delay >= 0 else default
 
 
 class ProfileAccessError(AuthError):
@@ -221,20 +241,13 @@ async def _profile_lookup_get(
             return response
         if attempt == 2:
             break
-        retry_after = response.headers.get("retry-after", "60")
-        try:
-            delay = float(retry_after)
-            if not isfinite(delay) or delay < 0:
-                delay = 60.0
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(retry_after)
-                delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                delay = 60.0
+        delay = retry_after_seconds(response.headers.get("retry-after"))
         tqdm.write(f"  Rate limit (429) ao buscar perfil. Aguardando {delay:g}s...")
         await asyncio.sleep(delay)
-    raise CollectionBlockedError("Limite de requisicoes (HTTP 429) ao buscar perfil apos 3 tentativas; coleta interrompida.")
+    raise RateLimitError(
+        "Limite de requisicoes (HTTP 429) ao buscar perfil apos 3 tentativas.",
+        retry_after_seconds(response.headers.get("retry-after")),
+    )
 
 
 async def fetch_user_id(
@@ -331,7 +344,9 @@ async def fetch_posts_page(
         if r.status_code == 403:
             raise AuthError("Acesso negado (403) — cookies inválidos ou expirados.")
         if r.status_code == 429:
-            wait = int(r.headers.get("retry-after", 60))
+            wait = retry_after_seconds(r.headers.get("retry-after"))
+            if attempt == 2:
+                raise RateLimitError("Limite de requisicoes (HTTP 429) ao buscar posts apos 3 tentativas.", wait)
             tqdm.write(f"  Rate limit (429). Aguardando {wait}s...")
             await asyncio.sleep(wait)
             continue

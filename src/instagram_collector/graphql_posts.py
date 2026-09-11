@@ -12,6 +12,7 @@ from instagram_scraper import (
     AuthError,
     CollectionBlockedError,
     ProfileAccessError,
+    RateLimitError,
     RateLimiter,
     ScrapeError,
     _first_int,
@@ -19,6 +20,7 @@ from instagram_scraper import (
     _raise_for_instagram_redirect,
     load_cookies,
     parse_post_metadata,
+    retry_after_seconds,
 )
 
 
@@ -162,7 +164,10 @@ class InstagramGraphqlPostCollector:
             raise ProfileAccessError(f"Instagram timeline GraphQL refused this profile request (HTTP {response.status_code}).")
         if response.status_code == 429:
             retry_after = response.headers.get("retry-after", "not supplied")
-            raise CollectionBlockedError(f"Instagram timeline GraphQL rate limited the session (HTTP 429; Retry-After: {retry_after}).")
+            raise RateLimitError(
+                f"Instagram timeline GraphQL rate limited the session (HTTP 429; Retry-After: {retry_after}).",
+                retry_after_seconds(response.headers.get("retry-after")),
+            )
         payload = _response_payload(response)
         messages = [payload.get("message")]
         if isinstance(payload.get("errors"), list):

@@ -212,6 +212,14 @@ class GalleryBackendTests(unittest.IsolatedAsyncioTestCase):
         request = json.loads(process.communicate.call_args.args[0])
         self.assertEqual(request["cookies"], {"sessionid": "fixture-secret"})
 
+    def test_story_config_throttles_extraction_and_downloads(self):
+        collector = adapter.GalleryDlStoryCollector(self.settings)
+        with TemporaryDirectory() as tmp, patch.object(collector, "_gallery_cookies", return_value={}):
+            config_data = collector._config(Path(tmp), self.session)
+        extractor = config_data["extractor"]
+        self.assertEqual(extractor["sleep"], self.settings.gallery_dl_sleep_download)
+        self.assertEqual(extractor["sleep-request"], self.settings.gallery_dl_sleep_request)
+
     async def test_timeout_stops_child_and_reports_error(self):
         process = Mock(returncode=None, communicate=AsyncMock(side_effect=[asyncio.TimeoutError(), (b"", b"")]))
         with patch.object(adapter.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)), patch.object(adapter.GalleryDlStoryCollector, "_gallery_cookies", return_value={}):

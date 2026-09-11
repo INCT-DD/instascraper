@@ -245,7 +245,7 @@ class MediaPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.db.init_schema()
         self.addCleanup(self.db.close)
         pool = SessionPool([{"name": "test"}], rotation_enabled=False)
-        settings = SimpleNamespace(job_limit_per_run=10)
+        settings = SimpleNamespace(job_limit_per_run=10, media_rate_limit_retry_seconds=300)
         self.processor = MediaJobProcessor(self.db, settings, session_pool=pool)
 
     def test_stories_precede_posts_regardless_of_numeric_priority(self) -> None:
@@ -289,6 +289,20 @@ class MediaPriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, ["stories", "post_media"])
         self.assertEqual((stats.failed, stats.processed), (1, 1))
         self.assertEqual(self.db.count_jobs_by_status(), {"retry": 1, "done": 1})
+
+    async def test_rate_limited_story_is_scheduled_for_later(self) -> None:
+        story_id = self.db.enqueue_job("stories", None, cursor="story", max_attempts=3)
+        with patch.object(
+            self.processor,
+            "_process_job",
+            new=AsyncMock(side_effect=RuntimeError("429 Too Many Requests")),
+        ), patch("builtins.print"):
+            await self.processor.process_pending_jobs(1)
+
+        job = self.db._fetchone("SELECT status, scheduled_at FROM collection_jobs WHERE id = ?", (story_id,))
+        self.assertEqual(job["status"], "retry")
+        self.assertEqual(self.db.fetch_pending_jobs(1), [])
+        self.assertGreater(datetime.fromisoformat(job["scheduled_at"]), datetime.now(timezone.utc))
 
 
 if __name__ == "__main__":

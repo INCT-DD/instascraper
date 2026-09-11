@@ -42,10 +42,14 @@ class Settings:
     account_rotation_enabled: bool
     gallery_dl_enabled: bool
     gallery_dl_binary: str
+    gallery_dl_sleep_download: str
     gallery_dl_sleep_request: str
     gallery_dl_timeout_seconds: int
+    media_rate_limit_retry_seconds: int
     posts_backend: str = "auto"
     instagram_timeline_doc_id: str = "7898261790222653"
+    profile_rate_limit_retries: int = 1
+    profile_block_wait_seconds: int = 0
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -79,6 +83,10 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
     posts_backend = os.environ.get("POSTS_BACKEND", "auto").strip().lower()
     if posts_backend not in {"auto", "graphql", "scraper", "gallery-dl"}:
         raise ValueError("POSTS_BACKEND must be auto, graphql, scraper or gallery-dl.")
+    retries = int(os.environ.get("PROFILE_RATE_LIMIT_RETRIES", "1"))
+    block_wait = int(os.environ.get("PROFILE_BLOCK_WAIT_SECONDS", "0"))
+    if not 0 <= retries <= 5 or block_wait < 0:
+        raise ValueError("PROFILE_RATE_LIMIT_RETRIES must be 0..5 and PROFILE_BLOCK_WAIT_SECONDS must be nonnegative.")
     return Settings(
         database_url=os.environ.get("DATABASE_URL") or _database_url_from_postgres_env(),
         timezone=os.environ.get("TIMEZONE", "America/Bahia"),
@@ -109,10 +117,14 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
         account_rotation_enabled=_bool_env("ACCOUNT_ROTATION_ENABLED", False),
         gallery_dl_enabled=_bool_env("GALLERY_DL_ENABLED", True),
         gallery_dl_binary=os.environ.get("GALLERY_DL_BINARY", "gallery-dl"),
+        gallery_dl_sleep_download=os.environ.get("GALLERY_DL_SLEEP_DOWNLOAD", "6.0-12.0"),
         gallery_dl_sleep_request=os.environ.get("GALLERY_DL_SLEEP_REQUEST", "6.0-12.0"),
         gallery_dl_timeout_seconds=int(os.environ.get("GALLERY_DL_TIMEOUT_SECONDS", "900")),
+        media_rate_limit_retry_seconds=int(os.environ.get("MEDIA_RATE_LIMIT_RETRY_SECONDS", "300")),
         posts_backend=posts_backend,
         instagram_timeline_doc_id=os.environ.get("INSTAGRAM_TIMELINE_DOC_ID", "7898261790222653"),
+        profile_rate_limit_retries=retries,
+        profile_block_wait_seconds=block_wait,
     )
 
 

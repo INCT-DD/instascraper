@@ -137,6 +137,7 @@ class GalleryDlStoryCollector:
                 "base-directory": str(target_dir),
                 "archive": str(state_dir / "gallery-dl-archive.sqlite3"),
                 "skip": True,
+                "sleep": self.settings.gallery_dl_sleep_download,
                 "sleep-request": self.settings.gallery_dl_sleep_request,
                 "sleep-429": "linear:60=300-900",
                 "retries": 4,

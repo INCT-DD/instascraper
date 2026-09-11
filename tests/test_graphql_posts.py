@@ -202,6 +202,7 @@ class GraphqlPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tmp = self.stack.enter_context(TemporaryDirectory())
         self.settings = replace(
             settings(), collect_post_media=True, media_queue_enabled=True,
+            profile_block_wait_seconds=300,
             data_dir=str(Path(tmp) / "data"), logs_dir=str(Path(tmp) / "logs"),
             reports_dir=str(Path(tmp) / "reports"), exports_dir=str(Path(tmp) / "exports"),
             candidate_archive_dir=str(Path(tmp) / "exports/instagram"), post_media_dir=str(Path(tmp) / "exports/instagram"),
@@ -212,6 +213,7 @@ class GraphqlPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.db.seed_profiles([{"username": "example", "name": "Fixture"}, {"username": "second", "name": "Second"}], False, False)
         self.session = CollectorSession("fixture", "fixture.json", "")
         self.stack.enter_context(patch.object(graphql, "load_cookies", return_value=COOKIES))
+        self.stack.enter_context(patch.object(pipeline.asyncio, "sleep", new=AsyncMock()))
 
     def use_transport(self, handler):
         original = httpx.AsyncClient
@@ -252,20 +254,36 @@ class GraphqlPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         again = await pipeline.collect_profile(self.db, self.settings, "example", START, END, enqueue_comments=False, session=self.session)
         self.assertEqual((again.posts_inserted, again.posts_updated, again.media_jobs_enqueued), (0, 1, 0))
 
-    async def test_period_block_records_failure_and_never_tries_other_profiles_or_sessions(self):
+    async def test_period_rate_limit_exhausts_retries_and_continues_all_profiles(self):
         handler = Mock(return_value=httpx.Response(429, text="limited"))
         self.use_transport(handler)
         with patch.object(pipeline, "seed_profiles"), patch.object(pipeline, "load_sessions", return_value=[
             {"name": "first"}, {"name": "second"},
         ]):
-            with self.assertRaises(CollectionBlockedError):
-                await pipeline.collect_posts_period(self.db, replace(self.settings, account_rotation_enabled=True), START, END)
-        self.assertEqual(handler.call_count, 1)
+            results = await pipeline.collect_posts_period(self.db, replace(self.settings, account_rotation_enabled=True), START, END)
+        self.assertEqual([r["status"] for r in results], ["failed", "failed"])
+        self.assertEqual(handler.call_count, 4)
         runs = self.db._fetchall("SELECT status, finished_at FROM collection_runs", ())
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["status"], "failed")
-        self.assertIsNotNone(runs[0]["finished_at"])
+        self.assertEqual(len(runs), 4)
+        self.assertTrue(all(r["status"] == "failed" and r["finished_at"] for r in runs))
         self.assertEqual(self.db._fetchone("SELECT COUNT(*) AS total FROM posts", ())["total"], 0)
+
+    async def test_period_rate_limit_recovers_and_finishes_next_profile(self):
+        requests = []
+        responses = [httpx.Response(429), httpx.Response(200, json=page([])), httpx.Response(200, json=page([]))]
+
+        def handle(request):
+            requests.append(json.loads(parse_qs(request.content.decode())["variables"][0])["username"])
+            return responses.pop(0)
+
+        self.use_transport(handle)
+        with patch.object(pipeline, "seed_profiles"), patch.object(pipeline, "load_sessions", return_value=[{"name": "fixture"}]):
+            results = await pipeline.collect_posts_period(self.db, self.settings, START, END)
+        self.assertEqual(requests, ["example", "example", "second"])
+        self.assertEqual([r["status"] for r in results], ["success", "success"])
+        self.assertEqual(self.db.list_incomplete_profiles_for_posts(START, END, failed_only=True), [])
+        runs = self.db._fetchall("SELECT status FROM collection_runs ORDER BY id", ())
+        self.assertEqual([r["status"] for r in runs], ["failed", "success", "success"])
 
     async def test_period_access_error_continues_and_retry_selects_only_failed_profile(self):
         requests = []
@@ -307,7 +325,7 @@ class GraphqlPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["profiles_error"], 1)
         self.assertEqual(report["profiles_success"], 1)
 
-    async def test_daily_block_finishes_report_with_failure_and_does_not_start_comments(self):
+    async def test_daily_block_continues_all_profiles_and_finishes_partial_report(self):
         handler = Mock(return_value=httpx.Response(400, json={"message": "feedback_required"}))
         self.use_transport(handler)
         with patch.object(pipeline, "seed_profiles"), \
@@ -316,13 +334,13 @@ class GraphqlPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             report = await pipeline.run_daily_collection(
                 self.db, self.settings, date(2026, 9, 1), collect_stories_enabled=False,
             )
-        self.assertEqual(handler.call_count, 1)
-        self.assertEqual(report["profiles_error"], 1)
-        self.assertEqual(report["errors"][0]["stage"], "collection_blocked")
-        self.assertEqual(len(report["profile_results"]), 1)
+        self.assertEqual(handler.call_count, 2)
+        self.assertEqual(report["profiles_error"], 2)
+        self.assertEqual(report["errors"][0]["stage"], "posts")
+        self.assertEqual(len(report["profile_results"]), 2)
         jobs.assert_not_awaited()
         runs = self.db._fetchall("SELECT status FROM collection_runs ORDER BY id", ())
-        self.assertEqual([r["status"] for r in runs], ["partial", "failed"])
+        self.assertEqual([r["status"] for r in runs], ["partial", "failed", "failed"])
 
 
 if __name__ == "__main__":

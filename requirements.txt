@@ -3,5 +3,6 @@ httpx[http2]
 requests
 psycopg[binary]
 gallery-dl
+yt-dlp
 tzdata
 

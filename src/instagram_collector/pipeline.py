@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from instagram_scraper import AuthError, CollectionBlockedError, ProfileAccessError, RateLimiter, ScrapeError
+from instagram_scraper import AuthError, CollectionBlockedError, ProfileAccessError, RateLimitError, RateLimiter, ScrapeError
 
 from .config import Settings, load_profiles, load_sessions
 from .files import dated_export_root, ensure_runtime_dirs, write_candidate_archives, write_daily_report, write_profile_posts
@@ -214,6 +215,34 @@ def _record_profile_result(
     )
 
 
+async def _collect_profile_with_rate_limit_retry(
+    db: Database,
+    settings: Settings,
+    username: str,
+    date_from: datetime,
+    date_to: datetime,
+    **kwargs: Any,
+) -> ProfileCollectionStats:
+    retries = 0
+    while True:
+        try:
+            return await collect_profile(db, settings, username, date_from, date_to, **kwargs)
+        except CollectionBlockedError as exc:
+            if settings.profile_block_wait_seconds == 0:
+                print(f"@{username}: recording failure and continuing without additional wait.", flush=True)
+                raise
+            delay = settings.profile_block_wait_seconds * (2 ** retries)
+            if isinstance(exc, RateLimitError):
+                delay = max(delay, exc.retry_after or 0)
+            retry = isinstance(exc, RateLimitError) and retries < settings.profile_rate_limit_retries
+            action = "retrying this profile" if retry else "recording failure and continuing"
+            print(f"@{username}: {exc} Waiting {delay:g}s before {action}.", flush=True)
+            await asyncio.sleep(delay)
+            if not retry:
+                raise
+            retries += 1
+
+
 async def _collect_profile_posts_with_sessions(
     db: Database,
     settings: Settings,
@@ -233,7 +262,7 @@ async def _collect_profile_posts_with_sessions(
     errors = []
     for candidate in [session, *sessions.alternatives(session)]:
         try:
-            stats = await collect_profile(
+            stats = await _collect_profile_with_rate_limit_retry(
                 db,
                 settings,
                 username,
@@ -250,8 +279,8 @@ async def _collect_profile_posts_with_sessions(
             return PostCollectionAttempt(stats=stats, session_alias=candidate.alias, errors=errors)
         except ProfileAccessError as exc:
             return PostCollectionAttempt(stats=None, session_alias=candidate.alias, errors=[str(exc)])
-        except CollectionBlockedError:
-            raise
+        except CollectionBlockedError as exc:
+            return PostCollectionAttempt(stats=None, session_alias=candidate.alias, errors=[str(exc)])
         except Exception as exc:
             last_error = exc
             errors.append(f"{candidate.alias}: {exc}")
@@ -576,15 +605,6 @@ async def run_daily_collection(
                     )
 
             _apply_profile_status(report, profile_result, collect_posts_enabled, collect_stories_enabled)
-        except CollectionBlockedError as exc:
-            profile_result["status"] = "failed"
-            profile_result["errors"].append(str(exc))
-            report["profiles_error"] += 1
-            report["errors"].append({"username": profile["username"], "stage": "collection_blocked", "error": str(exc)})
-            _record_profile_result(db, daily_run_id, profile, profile_result)
-            report["profile_results"].append(profile_result)
-            print("Collection stopped: Instagram restricted the session. Remaining profiles were not attempted.")
-            return _finish_daily_run(db, settings, daily_run_id, target_date, started_at, report)
         except Exception as exc:
             profile_result["status"] = "failed"
             profile_result["errors"].append(str(exc))

@@ -67,11 +67,21 @@ class MediaJobProcessor:
                 stats.stories_saved += counts.get("stories_saved", 0)
                 print(f"Media job {job['id']} done: {job['job_type']}")
             except Exception as exc:
-                self.db.mark_job_failed(job["id"], str(exc))
+                error_message = str(exc)
+                retry_delay = self._retry_delay_seconds(job, error_message)
+                self.db.mark_job_failed(job["id"], error_message, retry_delay_seconds=retry_delay)
                 stats.failed += 1
                 print(f"Media job {job['id']} failed: {exc}")
 
         return stats
+
+    def _retry_delay_seconds(self, job: Dict[str, Any], error_message: str) -> int:
+        if job["job_type"] != JOB_TYPE_STORIES:
+            return 0
+        normalized = error_message.lower()
+        if "429" in normalized or "too many requests" in normalized:
+            return max(0, self.settings.media_rate_limit_retry_seconds)
+        return 0
 
     async def watch(self, limit: Optional[int], sleep_seconds: Optional[int] = None) -> None:
         delay = sleep_seconds if sleep_seconds is not None else self.settings.media_worker_sleep_seconds

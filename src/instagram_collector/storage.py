@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -1020,11 +1020,12 @@ class Database:
             params = (*params, *exclude_job_ids)
         sql = (
             "SELECT * FROM collection_jobs "
-            f"WHERE status IN ('pending', 'retry') AND attempts < max_attempts {type_filter}"
+            f"WHERE status IN ('pending', 'retry') AND attempts < max_attempts "
+            f"AND scheduled_at <= {self.placeholder} {type_filter}"
             "ORDER BY CASE WHEN job_type = 'stories' THEN 0 ELSE 1 END, "
             "priority DESC, scheduled_at ASC, id ASC LIMIT ?"
         )
-        params = (*params, limit)
+        params = (self._now(), *params, limit)
         if self.is_postgres:
             sql = sql.replace("?", "%s")
         return self._fetchall(sql, params)
@@ -1088,17 +1089,23 @@ class Database:
             cur.execute(sql, (now, now, job_id))
         self.conn.commit()
 
-    def mark_job_failed(self, job_id: int, error_message: str) -> None:
+    def mark_job_failed(self, job_id: int, error_message: str, retry_delay_seconds: int = 0) -> None:
         job = self._fetchone(f"SELECT attempts, max_attempts FROM collection_jobs WHERE id = {self.placeholder}", (job_id,))
         status = "failed"
         if job and int(job["attempts"]) < int(job["max_attempts"]):
             status = "retry"
-        sql = "UPDATE collection_jobs SET status = ?, finished_at = ?, updated_at = ?, error_message = ? WHERE id = ?"
+        sql = (
+            "UPDATE collection_jobs SET status = ?, scheduled_at = ?, "
+            "finished_at = ?, updated_at = ?, error_message = ? WHERE id = ?"
+        )
         if self.is_postgres:
             sql = sql.replace("?", "%s")
         now = self._now()
+        scheduled_at = now
+        if status == "retry" and retry_delay_seconds > 0:
+            scheduled_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=retry_delay_seconds)).isoformat()
         with closing(self.conn.cursor()) as cur:
-            cur.execute(sql, (status, now, now, error_message[:2000], job_id))
+            cur.execute(sql, (status, scheduled_at, now, now, error_message[:2000], job_id))
         self.conn.commit()
 
     def store_raw_payload(
