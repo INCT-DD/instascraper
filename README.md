@@ -1,4 +1,4 @@
-# Instagram Academic Collector
+# Instascraper
 
 Pipeline de coleta academica para monitoramento de perfis publicos do Instagram. O projeto foi estruturado para rodar de forma local ou em servidor, com PostgreSQL, Docker Compose, rotacao de contas por cookies, coleta de posts, stories via `gallery-dl`, fila de comentarios, exportacao de relatorios, logs operacionais e notificacoes.
 
