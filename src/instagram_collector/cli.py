@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from math import isfinite
 import shutil
 from typing import Optional
@@ -13,6 +13,7 @@ from .gallerydl import GalleryDlStoryCollector
 from .jobs import JobProcessor
 from .logging_setup import configure_logging
 from .media_jobs import JOB_TYPE_STORIES, MediaJobProcessor
+from .media_refresh import refresh_failed_post_media
 from .notifications import build_crash_report, report_has_failure, send_report_notification
 from .pipeline import collect_posts_period, export_collected_day, explicit_window, run_daily_collection, seed_profiles
 from .sessions import SessionPool
@@ -89,6 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     media_jobs.add_argument("--limit", type=int, default=None)
     media_jobs.add_argument("--watch", action="store_true", help="Keep polling for pending media jobs.")
     media_jobs.add_argument("--sleep", type=int, default=None, help="Polling interval in seconds when --watch is used.")
+
+    refresh_media = sub.add_parser(
+        "refresh-failed-media",
+        help="Refresh expired URLs only for failed/retry post media jobs.",
+    )
+    refresh_media.add_argument("--start-date", required=True)
+    refresh_media.add_argument("--end-date", required=True)
+    refresh_media.add_argument("--limit", type=int, default=None, help="Maximum number of affected posts to refresh.")
 
     posts = sub.add_parser("collect-posts", help="Collect posts for a date range.")
     posts.add_argument("--start-date", required=True)
@@ -271,6 +280,25 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
                 )
                 return int(stats.failed > 0)
             return
+
+        if args.command == "refresh-failed-media":
+            start_date = date.fromisoformat(args.start_date)
+            end_date = date.fromisoformat(args.end_date)
+            if end_date < start_date:
+                raise ValueError("--end-date must not precede --start-date.")
+            stats = await refresh_failed_post_media(
+                db,
+                settings,
+                start_date.isoformat(),
+                (end_date + timedelta(days=1)).isoformat(),
+                args.limit,
+            )
+            print(
+                f"Media refresh finished: {stats.posts_found} affected posts; "
+                f"{stats.posts_refreshed} refreshed; {stats.assets_refreshed} media URLs; "
+                f"{stats.posts_failed} failures."
+            )
+            return int(stats.posts_failed > 0)
 
         if args.command == "collect-posts":
             date_from, date_to = explicit_window(

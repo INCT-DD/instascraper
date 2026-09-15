@@ -86,27 +86,34 @@ def _extract_raw_posts(request: Dict[str, Any]) -> Dict[str, Any]:
             ex.session.close()
 
 
-async def fetch_gallery_posts(
-    settings: Settings,
-    session: CollectorSession,
-    username: str,
-    date_from: datetime,
-    date_to: datetime,
-    rps: float,
-) -> List[Dict[str, Any]]:
-    if not math.isfinite(rps) or rps <= 0:
-        raise ValueError("RPS must be finite and greater than zero.")
-    if date_to < date_from:
-        raise ValueError("End date must not precede start date.")
-    request = {
-        "username": username,
-        "start": int(date_from.timestamp()),
-        "end": int(date_to.timestamp()),
-        "rps": rps,
-        "sleep_request": settings.gallery_dl_sleep_request,
-        "cookies": GalleryDlStoryCollector(settings)._gallery_cookies(session),
-    }
-    # Isolate gallery-dl's global config and synchronous HTTP client per session.
+def _extract_raw_post(request: Dict[str, Any]) -> Dict[str, Any]:
+    from gallery_dl import config, extractor, version
+
+    config.set(("extractor",), "sleep-request", request["sleep_request"])
+    config.set(("extractor",), "retries", 2)
+    config.set(("extractor",), "timeout", 25)
+    config.set(("extractor", "instagram"), "api", "rest")
+    config.set(("extractor", "instagram"), "cookies", request["cookies"])
+    shortcode = request["shortcode"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", shortcode):
+        raise ValueError("Invalid Instagram shortcode.")
+    ex = extractor.find(f"https://www.instagram.com/p/{shortcode}/")
+    if ex is None or not callable(getattr(ex, "posts", None)):
+        raise RuntimeError("Installed gallery-dl does not provide the Instagram post extractor.")
+    try:
+        ex.initialize()
+        ex.login()
+        posts = list(ex.posts())
+        post = next((item for item in posts if str(item.get("code")) == shortcode), None)
+        if post is None:
+            raise ScrapeError(f"gallery-dl did not return post {shortcode}.")
+        return {"post": post, "version": version.__version__}
+    finally:
+        if ex.session is not None:
+            ex.session.close()
+
+
+async def _run_gallery_request(settings: Settings, request: Dict[str, Any]) -> Dict[str, Any]:
     child_env = os.environ.copy()
     child_env["PYTHONPATH"] = os.pathsep.join(filter(None, (
         str(Path(__file__).resolve().parents[1]), child_env.get("PYTHONPATH"),
@@ -136,14 +143,59 @@ async def fetch_gallery_posts(
         error = re.sub(r"https?://\S+", "[Instagram endpoint]", error)
         if re.search(r"Too Many Requests|\b429\b", error, re.IGNORECASE):
             raise RateLimitError(f"gallery-dl posts rate limited the session: {error}")
-        if re.search(r"feedback_required|challenge_required|checkpoint_required|login_required|AuthRequired|Too Many Requests|\b429\b", error, re.IGNORECASE):
+        if re.search(r"feedback_required|challenge_required|checkpoint_required|login_required|AuthRequired", error, re.IGNORECASE):
             raise CollectionBlockedError(f"gallery-dl posts restricted the session: {error}")
         raise ScrapeError(f"gallery-dl posts failed: {error or 'extractor process failed'}")
     try:
-        response = json.loads(stdout)
+        return json.loads(stdout)
+    except (ValueError, TypeError) as exc:
+        raise ScrapeError("Invalid raw-post response from gallery-dl.") from exc
+
+
+async def fetch_gallery_posts(
+    settings: Settings,
+    session: CollectorSession,
+    username: str,
+    date_from: datetime,
+    date_to: datetime,
+    rps: float,
+) -> List[Dict[str, Any]]:
+    if not math.isfinite(rps) or rps <= 0:
+        raise ValueError("RPS must be finite and greater than zero.")
+    if date_to < date_from:
+        raise ValueError("End date must not precede start date.")
+    request = {
+        "username": username,
+        "start": int(date_from.timestamp()),
+        "end": int(date_to.timestamp()),
+        "rps": rps,
+        "sleep_request": settings.gallery_dl_sleep_request,
+        "cookies": GalleryDlStoryCollector(settings)._gallery_cookies(session),
+    }
+    # Isolate gallery-dl's global config and synchronous HTTP client per session.
+    response = await _run_gallery_request(settings, request)
+    try:
         return [normalize_gallery_post(raw, response["version"]) for raw in response["posts"]]
     except (ValueError, KeyError, TypeError) as exc:
         raise ScrapeError("Invalid raw-post response from gallery-dl.") from exc
+
+
+async def fetch_gallery_post(
+    settings: Settings,
+    session: CollectorSession,
+    shortcode: str,
+) -> Dict[str, Any]:
+    request = {
+        "operation": "post",
+        "shortcode": shortcode,
+        "sleep_request": settings.gallery_dl_sleep_request,
+        "cookies": GalleryDlStoryCollector(settings)._gallery_cookies(session),
+    }
+    response = await _run_gallery_request(settings, request)
+    try:
+        return normalize_gallery_post(response["post"], response["version"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ScrapeError("Invalid single-post response from gallery-dl.") from exc
 
 
 async def fetch_posts_with_backend(
@@ -195,7 +247,8 @@ async def fetch_posts_with_backend(
 def main() -> None:
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
     try:
-        response = _extract_raw_posts(json.load(sys.stdin))
+        request = json.load(sys.stdin)
+        response = _extract_raw_post(request) if request.get("operation") == "post" else _extract_raw_posts(request)
         json.dump(response, sys.stdout)
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)

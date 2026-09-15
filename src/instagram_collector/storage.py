@@ -772,7 +772,7 @@ class Database:
     def list_post_media_for_post(self, post_id: int, only_pending: bool = False) -> List[Dict[str, Any]]:
         status_filter = ""
         if only_pending:
-            status_filter = "AND COALESCE(download_status, '') NOT IN ('success', 'downloaded') "
+            status_filter = "AND COALESCE(download_status, '') NOT IN ('success', 'downloaded', 'superseded') "
         return self._fetchall(
             (
                 "SELECT * FROM post_media "
@@ -809,6 +809,116 @@ class Database:
                 ),
             )
         self.conn.commit()
+
+    def list_post_media_refresh_candidates(
+        self,
+        date_from: str,
+        date_to: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT p.*, pr.username, pr.name AS profile_name, "
+            "j.id AS media_job_id, j.status AS media_job_status "
+            "FROM collection_jobs j "
+            "JOIN posts p ON p.id = j.post_id "
+            "JOIN profiles pr ON pr.id = p.profile_id "
+            "WHERE j.job_type = 'post_media' AND j.status IN ('retry', 'failed') "
+            "AND j.id = (SELECT MAX(j2.id) FROM collection_jobs j2 "
+            "WHERE j2.post_id = p.id AND j2.job_type = 'post_media' "
+            "AND j2.status IN ('retry', 'failed')) "
+            f"AND p.taken_at_iso >= {self.placeholder} AND p.taken_at_iso < {self.placeholder} "
+            "AND EXISTS (SELECT 1 FROM post_media pm WHERE pm.post_id = p.id "
+            "AND COALESCE(pm.download_status, '') NOT IN ('success', 'downloaded', 'superseded')) "
+            "ORDER BY p.id"
+        )
+        params: Tuple[Any, ...] = (date_from, date_to)
+        if limit is not None:
+            sql += f" LIMIT {self.placeholder}"
+            params = (*params, limit)
+        return self._fetchall(sql, params)
+
+    def refresh_post_media_asset(self, post_id: int, media: Dict[str, Any]) -> bool:
+        media_index = int(media.get("index") or 1)
+        rows = self._fetchall(
+            (
+                "SELECT * FROM post_media WHERE post_id = ? AND media_index = ? "
+                "AND COALESCE(media_type, '') = COALESCE(?, '') "
+                "ORDER BY CASE WHEN download_status IN ('success', 'downloaded') THEN 0 ELSE 1 END, id DESC"
+            ).replace("?", self.placeholder),
+            (post_id, media_index, media.get("media_type")),
+        )
+        if not rows:
+            return False
+
+        source_url = str(media.get("url") or media.get("source_url") or "")
+        if not source_url:
+            return False
+        successful = next((row for row in rows if row.get("download_status") in {"success", "downloaded"}), None)
+        target = next((row for row in rows if str(row.get("source_url") or "") == source_url), rows[0])
+        if successful:
+            target = successful
+        refreshed = dict(media)
+        refreshed["download_status"] = "pending"
+        refreshed.pop("download_error", None)
+        supersede_sql = (
+            "UPDATE post_media SET download_status = 'superseded', updated_at = ? "
+            "WHERE post_id = ? AND media_index = ? AND id <> ? "
+            "AND COALESCE(download_status, '') NOT IN ('success', 'downloaded')"
+        )
+        refresh_sql = (
+            "UPDATE post_media SET media_type = ?, source_url = ?, width = ?, height = ?, "
+            "download_status = 'pending', error_message = NULL, raw_json = ?, updated_at = ? WHERE id = ?"
+        )
+        if self.is_postgres:
+            supersede_sql = supersede_sql.replace("?", "%s")
+            refresh_sql = refresh_sql.replace("?", "%s")
+        now = self._now()
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(supersede_sql, (now, post_id, media_index, target["id"]))
+            if successful:
+                self.conn.commit()
+                return False
+            cur.execute(
+                refresh_sql,
+                (
+                    media.get("media_type"),
+                    source_url,
+                    media.get("width"),
+                    media.get("height"),
+                    self._json_param(refreshed),
+                    now,
+                    target["id"],
+                ),
+            )
+        self.conn.commit()
+        return True
+
+    def reopen_post_media_job(self, job_id: int) -> None:
+        sql = (
+            "UPDATE collection_jobs SET status = 'pending', attempts = 0, scheduled_at = ?, "
+            "started_at = NULL, finished_at = NULL, error_message = NULL, updated_at = ? "
+            "WHERE id = ? AND job_type = 'post_media'"
+        )
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        now = self._now()
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(sql, (now, now, job_id))
+        self.conn.commit()
+
+    def claim_post_media_refresh(self, job_id: int) -> bool:
+        sql = (
+            "UPDATE collection_jobs SET status = 'running', started_at = ?, updated_at = ? "
+            "WHERE id = ? AND job_type = 'post_media' AND status IN ('retry', 'failed')"
+        )
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        now = self._now()
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(sql, (now, now, job_id))
+            claimed = cur.rowcount == 1
+        self.conn.commit()
+        return claimed
 
     def upsert_story(self, profile_id: int, story: Dict[str, Any]) -> Tuple[int, bool]:
         platform_story_id = str(

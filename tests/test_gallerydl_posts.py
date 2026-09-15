@@ -38,6 +38,19 @@ def settings():
 
 
 class GalleryNormalizationTests(unittest.TestCase):
+    def test_single_post_extractor_selects_exact_shortcode(self):
+        extractor = Mock()
+        extractor.posts.return_value = [{**raw_post(), "code": "OTHER"}, raw_post()]
+        extractor.session = Mock()
+        with patch("gallery_dl.extractor.find", return_value=extractor), patch("gallery_dl.config.set"):
+            result = adapter._extract_raw_post({
+                "shortcode": "EXAMPLE", "sleep_request": 0, "cookies": {"sessionid": "fixture"},
+            })
+        self.assertEqual(result["post"]["code"], "EXAMPLE")
+        extractor.initialize.assert_called_once()
+        extractor.login.assert_called_once()
+        extractor.session.close.assert_called_once()
+
     def test_installed_extractor_preserves_raw_payload_across_pages(self):
         import requests
         from gallery_dl import config as gallery_config

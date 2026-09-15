@@ -479,6 +479,7 @@ Alguns erros nao significam necessariamente perda da coleta:
 | `collect-posts` | Coleta posts por periodo, com opcao de filtrar por perfil. |
 | `collect-stories` | Enfileira stories com `MEDIA_QUEUE_ENABLED=true`; caso contrario, coleta diretamente com `gallery-dl`. |
 | `process-media-queue` | Processa a fila pendente de downloads de midias de posts e stories. Com `--watch`, fica rodando continuamente. |
+| `refresh-failed-media` | Renova URLs apenas dos posts com jobs de midia em `retry` ou `failed` no periodo informado. |
 | `process-comments-queue` | Processa a fila pendente de comentarios/replies. |
 | `process-jobs` | Alias operacional para processamento da fila. |
 | `export` | Gera exportacao do dia em pasta propria. |
@@ -498,6 +499,14 @@ docker compose logs -f media-worker
 O worker seleciona stories pendentes antes das midias de posts, independentemente da prioridade numerica do perfil. Dentro de cada tipo, permanece a ordem por prioridade, agendamento e identificador. A selecao e refeita depois de cada job: um story que chega durante o processamento passa a frente dos posts restantes. O job em andamento termina normalmente, inclusive os arquivos de um carrossel.
 
 Cada job pode ser tentado uma vez por ciclo; as retentativas continuam sujeitas ao numero maximo de tentativas. `--limit` define o tamanho do ciclo, e `--watch` repete os ciclos com a pausa de `--sleep`. `--skip-jobs` afeta apenas o processamento de comentarios/replies na coleta diaria, sem pausar o worker de midias. Stories precisam continuar disponiveis no Instagram quando o worker executar o download.
+
+URLs assinadas de fotos e videos podem expirar antes do download. Para renovar somente os posts que ainda possuem jobs em `retry` ou `failed`, sem paginar novamente todos os perfis, execute:
+
+```powershell
+docker compose run --rm app python -m pipeline refresh-failed-media --start-date 2026-09-11 --end-date 2026-09-11
+```
+
+O intervalo da CLI e inclusivo. O comando consulta cada permalink afetado, tenta as sessoes configuradas em rotacao, preserva ativos que ja foram baixados, atualiza apenas as URLs pendentes e reabre o respectivo job como `pending`. Ele nao baixa os arquivos diretamente; mantenha o `media-worker` ativo. `--limit N` restringe a quantidade de posts renovados em uma execucao.
 
 ### Resultado dos comandos
 

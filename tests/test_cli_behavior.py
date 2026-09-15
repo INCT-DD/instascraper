@@ -114,6 +114,13 @@ class CliBehaviorTests(unittest.TestCase):
                 cli.main(["process-media-queue"])
         self.assertEqual(caught.exception.code, 1)
 
+    def test_refresh_failed_media_uses_inclusive_cli_date_range(self) -> None:
+        stats = SimpleNamespace(posts_found=2, posts_refreshed=1, assets_refreshed=3, posts_failed=0)
+        with patch.object(cli, "refresh_failed_post_media", new=AsyncMock(return_value=stats)) as refresh:
+            cli.main(["refresh-failed-media", "--start-date", "2026-09-10", "--end-date", "2026-09-11"])
+        refresh.assert_awaited_once_with(self.db, self.settings, "2026-09-10", "2026-09-12", None)
+        self.assertIn("3 media URLs", self.output.getvalue())
+
     def test_profile_alias_propagates_post_and_comment_failures(self) -> None:
         self.settings_loader.return_value = replace(self.settings, collect_comments_default=True)
         processor = Mock(process_pending_jobs=AsyncMock(return_value=JobStats(failed=1)))
