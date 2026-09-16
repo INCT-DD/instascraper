@@ -1,79 +1,168 @@
-# Posts: endpoints e preservacao dos metadados
+# Coleta de posts, mídias e métricas
 
-## Timeline GraphQL como backend principal
+Este documento descreve como publicações são descobertas, normalizadas e atualizadas. Embora o nome histórico do arquivo mencione `gallery-dl`, a coleta de posts utiliza uma cadeia de backends; `gallery-dl` também permanece responsável por stories e por parte do download de mídia.
 
-Em 08/09/2026, a operacao de timeline usada pelo Instaloader foi validada com a sessao existente: duas paginas de 12 posts, sem IDs repetidos entre paginas. A consulta usa `POST /graphql/query`, doc_id `7898261790222653` e a variavel `__relay_internal__pv__PolarisFeedShareMenurelayprovider=false`. Apenas HTTP 200 nao comprova sucesso: a conexao `data.xdt_api__v1__feed__user_timeline_graphql_connection`, seus nodes e os dados de paginacao precisam existir.
+## Separação entre descoberta e download
 
-`POSTS_BACKEND=auto` comeca por GraphQL; falhas de contrato/transporte podem usar REST e gallery-dl. `POSTS_BACKEND=graphql` seleciona apenas a timeline. `INSTAGRAM_TIMELINE_DOC_ID` permite atualizar o identificador sem alterar a persistencia. O adaptador envia CSRF, filtra as datas, elimina IDs duplicados e preserva o node bruto em `raw_json`, com a origem em `_collector`. A timeline nao retornou reposts no teste; o adaptador nao faz chamadas adicionais por post para preencher essa metrica.
+A pipeline possui duas etapas independentes:
 
-Respostas 401/403 da timeline encerram somente a tentativa do perfil, registrada como failed, e a coleta segue para o proximo perfil respeitando o limitador compartilhado. Nao ha fallback nem troca de conta para repetir aquele perfil. A recusa ainda pode ser um problema da sessao inteira; a continuacao nao comprova que ela esteja valida. `collect-posts --retry-failed` repete apenas as ultimas tentativas falhadas do mesmo intervalo; `--resume` inclui tambem perfis interrompidos ou nunca tentados. Ambos usam o historico existente e nao resetam jobs de midia.
+1. **Descoberta:** consulta a timeline, normaliza metadados, persiste posts e identifica mídias.
+2. **Download:** o `media-worker` consome jobs e grava os arquivos localmente.
 
-O padrao `PROFILE_BLOCK_WAIT_SECONDS=0` registra bloqueios como falha e segue sem espera adicional nem repeticao automatica do perfil. O intervalo `--rps` e as esperas internas dos adaptadores continuam independentes. Um valor positivo reativa a politica opcional: repeticao limitada de 429 na mesma sessao, espera exponencial e respeito a `Retry-After`; outros bloqueios esperam sem repetir o perfil. A run do perfil termina como failed e a diaria como partial se necessario. Nao ha cooldown persistente nem coordenacao com workers independentes; a continuacao nao garante que uma sessao recusada volte a funcionar.
+Um post persistido não significa que todas as suas mídias já foram baixadas. Essa separação permite continuar descobrindo posts enquanto downloads maiores ocorrem em segundo plano.
 
-As verificacoes abaixo documentam o fallback REST e o GraphQL antigo do gallery-dl, distintos da timeline agora utilizada. A prioridade de stories na fila e o download HTTP das midias permanecem os mesmos.
+## Backends de posts
 
-## Verificacao anterior a implementacao
+`POSTS_BACKEND` controla a estratégia.
 
-Foram consultadas as colunas reais de `posts` e `post_media` no PostgreSQL e a implementacao instalada do gallery-dl 1.32.11. Tambem foi feita uma consulta real de detalhe de um post, antes de implementar o adaptador.
-
-O parser padrao `_parse_post_rest` seleciona somente parte do payload do Instagram. O adaptador captura os itens do extrator antes dessa transformacao. A opcao `metadata` do Instagram no gallery-dl amplia informacoes do usuario; ela nao restaura as metricas de posts descartadas pelo parser.
-
-## Correspondencia com o banco
-
-| Coluna | Origem |
+| Valor | Comportamento |
 |---|---|
-| `id`, `profile_id` | Identificadores locais da pipeline |
-| `platform_post_id` | `pk`, com alternativa `id` |
-| `shortcode`, `url` | `code` e URL publica derivada |
-| `taken_at`, `taken_at_iso` | `taken_at`, convertido para ISO em UTC |
-| `media_type`, `is_video` | `media_type` REST; mantida a convencao atual para carrosseis |
-| `caption` | `caption.text` |
-| `likes` | `like_count`, quando disponibilizado |
-| `comments_count` | `comment_count`, quando disponibilizado |
-| `reposts` | Mesma lista de chaves do projeto, incluindo `media_repost_count` |
-| `views` | `play_count` ou `view_count`, quando disponibilizado |
-| `accessibility_caption` | Campo homonimo, quando disponibilizado |
-| `raw_json` | Item REST completo, mais `_collector` com origem e versao |
-| `collected_at`, `updated_at` | Gerados pelo banco |
-| `post_media` | URLs, indices e dimensoes de `image_versions2`, `video_versions` e `carousel_media`; caminhos e status gerados pela pipeline |
+| `auto` | Tenta timeline GraphQL, depois REST e, em falhas compatíveis, o adaptador baseado no `gallery-dl`. |
+| `graphql` | Usa apenas a timeline GraphQL autenticada. |
+| `scraper` | Usa o coletor REST do projeto e pode recorrer ao adaptador `gallery-dl` conforme a classe da falha. |
+| `gallery-dl` | Usa diretamente a API REST interna exposta pelo extrator instalado. |
 
-Campos ausentes nao sao inferidos como zero. Em atualizacoes, valores anteriores das metricas sao preservados quando a resposta omite o campo; `raw_json` registra a resposta mais recente e permite identificar essa ausencia. Um valor preservado nao constitui uma nova medicao. O campo `reposts` mantem a convencao existente do projeto: as chaves de repost e compartilhamento devem ser avaliadas no payload, pois nao garantem equivalencia conceitual.
+Falhas de autenticação, bloqueio ou contrato são classificadas para evitar que uma resposta recusada seja tratada como timeline vazia. O resultado falho é registrado por perfil e a pipeline segue para os demais.
 
-## Endpoints observados
+## Timeline GraphQL
 
-Testes limitados em 06/09/2026, com a sessao configurada e `abmarinho`:
+O backend principal envia `POST /graphql/query` com o `doc_id` configurado em `INSTAGRAM_TIMELINE_DOC_ID`. A resposta válida precisa conter a conexão da timeline, nodes e informações de paginação; HTTP 200 isolado não comprova sucesso.
 
-| Operacao | Endpoint | Resultado observado |
-|---|---|---|
-| Consulta inicial do scraper no log recebido | `/api/v1/users/web_profile_info/` | HTTP 429 |
-| Resolucao de usuario pelo gallery-dl | `/web/search/topsearch/` | HTTP 200 |
-| Listagem REST pelo gallery-dl | `/api/v1/feed/user/173847131/` | Redirecionamento para a pagina inicial |
-| Detalhe de post pelo gallery-dl | `/api/v1/media/3975322793350253472/info/` | HTTP 200 |
-| Listagem GraphQL pelo gallery-dl | `/graphql/query/` | HTTP 400 |
-| Stories, teste anterior | `/api/v1/feed/reels_media/` no extrator REST | Uma imagem baixada e um registro persistido |
+Cada página normalmente contém vários posts e corresponde a uma requisição. A paginação continua até uma destas condições:
 
-No detalhe de `DcrLwS1J8ug`, vieram 45 comentarios, 36 reposts, legenda, acessibilidade e uma imagem. Visualizacoes nao vieram nesse post de foto. O parser padrao do gallery-dl descartou comentarios, reposts e acessibilidade ao transformar a mesma resposta.
+- não existir próxima página;
+- o cursor se repetir ou estiver ausente;
+- os posts regulares da página forem anteriores ao início do período;
+- no modo incremental, aparecer um post regular já conhecido.
 
-O gallery-dl usa um cookie jar, acompanha CSRF e `X-IG-WWW-Claim` e resolve usuarios por `search`/`web`. Contudo, a listagem REST usa a mesma rota de feed do scraper. O sucesso do detalhe de um post conhecido nao permite descobrir todas as publicacoes novas quando o feed esta indisponivel. O GraphQL antigo do gallery-dl, baseado em query_hash, continua desabilitado; a nova timeline com doc_id e um adaptador separado.
+Posts fixados não definem o limite cronológico, pois podem ser antigos e aparecer no topo da primeira página.
 
-Os resultados descrevem uma sessao e um momento; nao demonstram bloqueio geral da conta ou indisponibilidade de todos os perfis.
+## REST e adaptador gallery-dl
 
-## Limites operacionais
+O backend REST resolve o perfil e consulta o feed autenticado. O adaptador `gallery-dl` usa a biblioteca instalada para autenticação e resolução do usuário, preservando os itens REST antes da transformação simplificada feita pelo extrator padrão.
 
-- `POSTS_BACKEND=auto` tenta GraphQL, scraper REST e gallery-dl; os demais valores selecionam somente um backend.
-- O adaptador REST preserva a sessao selecionada e as datas UTC da coleta por periodo.
-- A varredura ignora fixados antigos e termina apos 30 posts antigos nao fixados consecutivos. Depende da ordem cronologica do feed, assim como o coletor atual.
-- Erro ou timeout antes de concluir a extracao resulta em falha, sem anunciar um subconjunto como coleta completa.
-- Cookies passam por stdin do subprocesso, nunca por argumentos de linha de comando.
-- A biblioteca deve estar instalada no mesmo ambiente Python; atualizacoes devem executar os testes de compatibilidade do adaptador.
-- As URLs do CDN podem expirar antes do processamento. Enfileirar uma midia nao comprova seu download.
-- A lista de posts conhecidos no banco nao substitui uma listagem falhada, pois isso esconderia publicacoes ainda nao descobertas.
+Esse cuidado é necessário para manter:
 
-## Fontes
+- identificadores e shortcode;
+- legenda e acessibilidade;
+- contadores presentes no payload;
+- variantes de imagem e vídeo;
+- itens de carrossel;
+- payload bruto para auditoria.
 
-- [Timeline autenticada do Instaloader](https://github.com/instaloader/instaloader/blob/master/instaloader/structures.py)
-- [Paginacao por doc_id](https://github.com/instaloader/instaloader/blob/master/instaloader/nodeiterator.py)
+A integração depende de APIs privadas e de detalhes internos da versão instalada do `gallery-dl`. Atualizações da biblioteca devem ser acompanhadas pela suíte de compatibilidade.
 
-- [Extrator na versao inspecionada](https://github.com/mikf/gallery-dl/blob/v1.32.11/gallery_dl/extractor/instagram.py)
-- [Estrategias para resolver usuarios](https://gdl-org.github.io/docs/configuration.html#extractorinstagramuser-strategy)
-- [Opcao metadata](https://gdl-org.github.io/docs/configuration.html#extractorinstagrammetadata)
+## Coleta incremental
+
+`--new-only` carrega do banco os identificadores dos posts mais recentes de cada perfil e os entrega ao backend selecionado.
+
+O algoritmo:
+
+1. consulta a primeira página;
+2. ignora posts conhecidos em vez de enviá-los ao `upsert`;
+3. preserva posts novos encontrados na mesma página;
+4. não encerra por um post fixado conhecido;
+5. encerra ao encontrar o primeiro post regular conhecido.
+
+Exemplo:
+
+```powershell
+docker compose run --rm app python -m pipeline collect-posts --start-date 2026-09-01 --end-date 2026-09-15 --no-comments --new-only --rps 0.2
+```
+
+O modo reduz páginas e processamento redundantes, mas não elimina a requisição inicial de cada perfil. Se nenhum dos identificadores recentes for encontrado, a paginação continua até o limite temporal; isso privilegia completude em vez de assumir que não há posts novos.
+
+`--new-only` não se aplica a stories. Stories são consultados somente entre os conteúdos ativos e a deduplicação ocorre na persistência e na fila.
+
+## Normalização
+
+Os backends convergem para o mesmo contrato interno.
+
+| Coluna | Fontes observadas |
+|---|---|
+| `platform_post_id` | `pk` ou `id`. |
+| `shortcode` | `code` ou `shortcode`. |
+| `taken_at` | Timestamp da publicação. |
+| `media_type` | Foto, vídeo ou carrossel. |
+| `caption` | Texto da legenda. |
+| `likes` | `like_count`. |
+| `comments_count` | `comment_count`. |
+| `views` | Primeiro valor disponível entre `play_count`, `ig_play_count`, `video_view_count` e `view_count`. |
+| `reposts` | `media_repost_count` e variantes compatíveis de repost/share/reshare. |
+| `raw_json` | Payload de descoberta acrescido de metadados do coletor. |
+
+Ausência e zero têm significados diferentes. Campo ausente é armazenado como desconhecido; zero representa uma medição fornecida pela plataforma.
+
+## Por que GraphQL não preenche todas as métricas
+
+O payload atual da timeline GraphQL foi observado com `view_count` ausente ou nulo na maioria dos vídeos e sem contadores de repost. Isso não significa necessariamente que o post tenha zero visualizações ou reposts: a timeline simplesmente não forneceu o dado.
+
+O endpoint REST de detalhe `/api/v1/media/{platform_post_id}/info/` fornece, dependendo do post e da sessão, campos como:
+
+- `play_count`;
+- `ig_play_count`;
+- `media_repost_count`;
+- `like_count`;
+- `comment_count`.
+
+Por isso, descoberta e atualização de métricas são casos de uso separados.
+
+## Atualização de métricas
+
+`refresh-post-metrics` seleciona posts já armazenados e consulta o detalhe de cada um.
+
+```powershell
+docker compose run --rm app python -m pipeline refresh-post-metrics --start-date 2026-09-01 --end-date 2026-09-15 --username lulaoficial --limit 100 --rps 0.1
+```
+
+Regras de persistência:
+
+- valores retornados atualizam curtidas, comentários, visualizações e reposts;
+- `null` ou campo ausente preserva o valor anterior;
+- zero substitui o valor anterior;
+- o `raw_json` original da descoberta não é substituído;
+- a resposta de detalhe é gravada em `raw_payloads` como `post_metrics`;
+- sessões alternativas podem ser tentadas quando a rotação está habilitada.
+
+O custo é de aproximadamente uma requisição por post, além de eventuais tentativas de sessão. Use `--limit` e uma taxa conservadora em bases grandes.
+
+## Identificação e download de mídias
+
+Na descoberta, cada variante principal é transformada em um item de `post_media`. Carrosséis produzem múltiplos itens ordenados. O registro contém URL de origem, tipo, dimensões e status de download.
+
+O worker baixa a URL direta fornecida pelo Instagram/CDN. Ele não abre a página pública do post para obter o arquivo. Dependendo do vídeo, o `gallery-dl` pode delegar formatos ao `yt-dlp` e tentar URLs alternativas.
+
+URLs de CDN possuem assinatura e expiração. Um job processado muito tempo depois pode receber 403 mesmo com cookies válidos.
+
+## Renovação de URLs falhadas
+
+Para posts com mídia em `failed` ou `retry`:
+
+```powershell
+docker compose run --rm app python -m pipeline refresh-failed-media --start-date 2026-09-01 --end-date 2026-09-15 --limit 100
+docker compose up -d media-worker
+```
+
+A renovação consulta novamente o post afetado, atualiza os assets e reabre os jobs aplicáveis. Ela não refaz toda a coleta do período.
+
+## Stories
+
+Stories são coletados pelo `gallery-dl` a partir dos itens ativos do perfil. Quando `MEDIA_QUEUE_ENABLED=true`, `collect-stories` cria jobs com prioridade superior à mídia de posts. O worker pode estar baixando posts, mas selecionará os stories pendentes prioritários nos ciclos seguintes.
+
+O `gallery-dl` gera requisições para descobrir stories e outras para cada arquivo. `GALLERY_DL_SLEEP_REQUEST` e `GALLERY_DL_SLEEP_DOWNLOAD` controlam essas etapas separadamente.
+
+## Limitações e interpretação
+
+- Endpoints utilizados não são uma API acadêmica pública e podem mudar sem aviso.
+- Métricas disponíveis variam por tipo de mídia, perfil, sessão e momento.
+- `media_repost_count` é preservado como `reposts`, mas sua interpretação deve ser descrita metodologicamente; não se deve assumir equivalência universal com compartilhamentos externos.
+- Um HTTP 200 pode conter erro lógico ou estrutura inesperada.
+- Rotação de contas não garante acesso e não substitui espera após rate limit.
+- Downloads bem-sucedidos dependem da validade das URLs, disponibilidade do conteúdo e espaço em disco.
+- Conteúdo removido antes da descoberta não pode ser recuperado pela pipeline.
+
+## Referências técnicas
+
+- [Configuração do gallery-dl](https://gdl-org.github.io/docs/configuration.html)
+- [Extrator Instagram do gallery-dl](https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/instagram.py)
+- [Documentação do httpx](https://www.python-httpx.org/)

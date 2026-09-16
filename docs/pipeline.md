@@ -1,127 +1,165 @@
-# Pipeline diaria de coleta academica
+# Arquitetura e operação da pipeline
 
-Esta estrutura preserva `instagram_scraper.py` e adiciona um pipeline leve em
-`src/instagram_collector/`. O scraper atual continua sendo o motor de posts,
-comentarios e replies. O `gallery-dl` entra como coletor complementar de stories
-disponiveis no momento da execucao.
+Este documento descreve os componentes, os limites de responsabilidade e os procedimentos operacionais do Instascraper. A lista exata de comandos e opções está em [Referência da CLI](cli.md).
 
-## Arquitetura
+## Visão arquitetural
 
-- `instagram_scraper.py`: fluxo legado interativo e funcoes reaproveitadas.
-- `profiles.json`: lista configuravel de perfis monitorados.
-- `sessions.json`: lista local de contas/cookies. Nao versionar este arquivo.
-- `migrations/001_init.sql`: schema PostgreSQL versionado.
-- `src/instagram_collector/scraper.py`: wrapper nao interativo do motor atual.
-- `src/instagram_collector/gallerydl.py`: runner isolado do `gallery-dl` para stories.
-- `src/instagram_collector/jobs.py`: fila de comentarios/replies com retry e limites.
-- `src/instagram_collector/pipeline.py`: orquestracao diaria/manual.
-- `src/instagram_collector/files.py`: NDJSON, CSV, relatorios e export.
-
-## Docker Compose
-
-O modo recomendado para servidor usa dois servicos:
-
-- `postgres`: PostgreSQL com volume persistente.
-- `app`: container da pipeline para comandos pontuais e execucoes agendadas.
-
-Prepare o `.env`:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Edite pelo menos:
-
-```env
-POSTGRES_DB=instagram_collector
-POSTGRES_USER=collector
-POSTGRES_PASSWORD=troque_esta_senha
-TIMEZONE=America/Bahia
-```
-
-Suba o ambiente:
-
-```powershell
-docker compose up -d --build
-```
-
-Rode migrations e seed:
-
-```powershell
-docker compose run --rm app python -m pipeline migrate
-docker compose run --rm app python -m pipeline seed-profiles
-```
-
-Comandos pontuais dentro do container:
-
-```powershell
-docker compose run --rm app python -m pipeline run-daily --skip-jobs
-docker compose run --rm app python -m pipeline collect-posts --start-date 2026-07-01 --end-date 2026-07-23
-docker compose run --rm app python -m pipeline collect-stories --date 2026-07-23
-docker compose run --rm app python -m pipeline process-comments-queue --limit 100
-docker compose run --rm app python -m pipeline export --date 2026-07-23
-```
-
-`collect-posts` coleta apenas publicações do feed/reels dentro do período informado. Para posts e stories no mesmo ciclo, use `run-daily`; para stories disponíveis naquele momento, use `collect-stories`.
-
-Volumes do Compose:
+A aplicação segue uma arquitetura modular orientada a casos de uso. A CLI recebe o comando, a camada de pipeline coordena coletores e persistência, e os adaptadores isolam Instagram, `gallery-dl`, banco e sistema de arquivos.
 
 ```text
-postgres_data  -> /var/lib/postgresql/data
-media_data     -> /app/data
-logs_data      -> /app/logs
-reports_data   -> /app/reports
-exports_data   -> /app/exports
+CLI
+ ├─ coleta diária ou por período
+ ├─ manutenção de métricas e mídias
+ ├─ processamento de filas
+ └─ exportação e administração
+        │
+        v
+Pipeline de aplicação
+ ├─ seleção de perfis e sessões
+ ├─ controle de taxa e retomada
+ ├─ normalização e persistência
+ └─ criação de jobs
+        │
+        ├─> PostgreSQL
+        ├─> Instagram GraphQL/REST
+        ├─> gallery-dl
+        └─> exports, logs e relatórios
 ```
 
-Arquivos locais montados como somente leitura:
+## Componentes
 
-```text
-profiles.json
-sessions.json
-cookies/
-```
+| Componente | Responsabilidade |
+|---|---|
+| `pipeline.py` | Ponto de entrada para `python -m pipeline`. |
+| `src/instagram_collector/cli.py` | Parser, validação de argumentos e despacho dos casos de uso. |
+| `src/instagram_collector/pipeline.py` | Orquestra coleta diária, períodos, perfis, sessões e exports. |
+| `src/instagram_collector/graphql_posts.py` | Timeline GraphQL e paginação de posts. |
+| `src/instagram_collector/scraper.py` | Adaptador REST para posts e comentários. |
+| `src/instagram_collector/gallerydl_posts.py` | Fallback de posts via API REST utilizada pelo `gallery-dl`. |
+| `src/instagram_collector/gallerydl.py` | Coleta e download de stories. |
+| `src/instagram_collector/post_metrics.py` | Atualização das métricas de posts já persistidos. |
+| `src/instagram_collector/media_jobs.py` | Worker e regras da fila de mídia. |
+| `src/instagram_collector/jobs.py` | Fila opcional de comentários e respostas. |
+| `src/instagram_collector/storage.py` | Acesso PostgreSQL/SQLite, schema, upserts e consultas operacionais. |
+| `src/instagram_collector/files.py` | Arquivos brutos, relatórios e estrutura de exportação. |
+| `src/instagram_collector/sessions.py` | Sessões, aliases e rotação de contas. |
+| `src/instagram_collector/notifications.py` | Telegram e SMTP para execuções agendadas. |
 
-Para parar:
+## Serviços Docker
+
+O `docker-compose.yml` define três serviços:
+
+### postgres
+
+PostgreSQL 16 com health check e volume `postgres_data`. A porta pode ser exposta ao host por `POSTGRES_HOST_PORT`.
+
+### app
+
+Imagem da aplicação mantida ativa para comandos pontuais. O uso normal é:
 
 ```powershell
-docker compose down
+docker compose run --rm app python -m pipeline <comando>
 ```
 
-Para apagar volumes persistentes, use apenas quando tiver certeza:
+### media-worker
+
+Executa continuamente `process-media-queue --watch`. O serviço compartilha banco, cookies e diretórios com o `app`. Alterações de configuração exigem recriação do container:
 
 ```powershell
-docker compose down -v
+docker compose up -d --build --force-recreate media-worker
 ```
 
-## Ambiente local sem Docker
+## Persistência e volumes
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-python -m pipeline migrate
-python -m pipeline seed-profiles
-```
+| Volume ou montagem | Conteúdo |
+|---|---|
+| `postgres_data` | Banco PostgreSQL. |
+| `media_data` | Dados locais sob `/app/data`. |
+| `logs_data` | Logs sob `/app/logs`. |
+| `reports_data` | Relatórios sob `/app/reports`. |
+| `HOST_EXPORTS_DIR` | Pasta do host montada em `/app/exports`. |
+| `profiles.json` | Perfis, somente leitura. |
+| `sessions.json` | Sessões, somente leitura. |
+| `cookies/` | Cookies, somente leitura. |
 
-## Perfis
+O banco permanece no computador ou servidor que executa o Docker. Montar `HOST_EXPORTS_DIR` em uma pasta do OneDrive transfere exports e mídias para essa pasta, mas não move o PostgreSQL para a nuvem.
 
-Edite `profiles.json` para trocar o conjunto monitorado sem alterar codigo:
+## Modelo de dados
+
+| Tabela | Papel |
+|---|---|
+| `profiles` | Cadastro e regras de cada perfil. |
+| `posts` | Publicações normalizadas e métricas atuais. |
+| `post_media` | Mídias identificadas, URL de origem, caminho e status. |
+| `stories` | Stories preservados durante a janela de disponibilidade. |
+| `comments` e `replies` | Dados opcionais de interação textual. |
+| `collection_jobs` | Jobs de comentários, mídias de posts e stories. |
+| `collection_runs` | Execuções globais e seus resultados. |
+| `profile_collection_status` | Resultado de cada perfil por tipo e intervalo. |
+| `raw_payloads` | Evidência bruta de coleta e atualização. |
+
+Os identificadores da plataforma e shortcodes possuem restrições de unicidade. Repetir uma coleta é seguro para os registros principais: o `upsert` insere dados novos e atualiza o que já existe.
+
+## Fluxo de posts
+
+1. A CLI valida período e opções.
+2. Os perfis são sincronizados de `profiles.json` ou CSV para o banco.
+3. A pipeline seleciona perfis ativos, ou um único `--username`.
+4. O pool escolhe uma sessão autenticada.
+5. O backend lista páginas até o limite temporal ou incremental.
+6. Cada post é normalizado e persistido.
+7. O payload bruto é registrado para auditoria.
+8. As mídias identificadas são persistidas em `post_media`.
+9. Jobs de mídia são criados quando a fila está habilitada.
+10. O resultado do perfil e da execução é gravado separadamente.
+
+Uma falha de perfil é registrada e a coleta segue para os demais. Códigos de saída diferentes de zero informam que houve falha ou resultado parcial.
+
+## Fluxo de stories
+
+Stories não possuem coleta histórica equivalente à timeline de posts. O comando consulta o conjunto disponível naquele momento e cria um job por perfil. O job recebe prioridade superior à mídia de posts e é processado primeiro pelo worker.
+
+Reexecutar a coleta não duplica jobs equivalentes. Entretanto, stories que expiraram antes da consulta não podem ser recuperados pela pipeline.
+
+## Filas
+
+### Mídias
+
+O `media-worker` busca jobs pendentes por prioridade. Stories têm prioridade operacional sobre posts. `MEDIA_QUEUE_LIMIT` limita o lote de cada ciclo, não o total histórico da fila. `MEDIA_WORKER_SLEEP_SECONDS` controla a espera quando o modo `--watch` volta a consultar o banco.
+
+Estados usuais: `pending`, `processing`, `retry`, `done` e `failed`.
+
+### Comentários
+
+Comentários e respostas são opcionais e ficam desabilitados quando `COLLECT_COMMENTS_DEFAULT=false`. `--skip-jobs` evita processar essa fila durante a execução diária; não controla o worker de mídia.
+
+## Perfis e sessões
+
+### Perfis
+
+`PROFILES_PATH` aceita:
+
+- um JSON com uma lista de perfis;
+- um CSV;
+- um diretório com múltiplos JSONs e CSVs.
+
+Exemplo:
 
 ```json
 [
   {
-    "name": "Lula",
-    "username": "lulaoficial",
+    "name": "Perfil de exemplo",
+    "username": "perfil.exemplo",
     "active": true,
-    "notes": "grupo presidencial",
-    "priority": 10
+    "priority": 10,
+    "notes": "grupo de pesquisa"
   }
 ]
 ```
 
-## Sessoes e rotacao
+`profiles.json` é local. `profile.example.json` é o modelo versionado.
 
-Crie `sessions.json` a partir de `sessions.example.json`:
+### Sessões
 
 ```json
 [
@@ -134,209 +172,107 @@ Crie `sessions.json` a partir de `sessions.example.json`:
 ]
 ```
 
-Para habilitar rotacao:
+Com `ACCOUNT_ROTATION_ENABLED=true`, uma operação compatível pode tentar sessões alternativas após falha. A rotação não ocorre a cada requisição e não deve ser usada para contornar restrições da plataforma.
 
-```env
-ACCOUNT_ROTATION_ENABLED=true
-```
+## Instalação sem Docker
 
-Os logs usam aliases anonimizados como `session-1a2b3c4d`. O pipeline nunca
-imprime valores de cookies. Se uma sessao falhar, outra sessao ativa e tentada
-uma vez, sem loop infinito.
+Em Debian/Ubuntu:
 
-## Comandos
-
-Coleta diaria completa, posts do dia + stories disponiveis:
-
-```powershell
-python -m pipeline run-daily --skip-jobs
-```
-
-Coleta diaria de uma data especifica:
-
-```powershell
-python -m pipeline run-daily --date 2026-07-23 --skip-jobs
-```
-
-Somente posts:
-
-```powershell
-python -m pipeline run-daily --posts-only --skip-jobs
-```
-
-Somente stories:
-
-```powershell
-python -m pipeline run-daily --stories-only --skip-jobs
-```
-
-Coleta manual por periodo:
-
-```powershell
-python -m pipeline collect-posts --start-date 2026-07-01 --end-date 2026-07-23
-```
-
-Coleta separada de stories:
-
-```powershell
-python -m pipeline collect-stories --date 2026-07-23
-```
-
-Processar fila de comentarios:
-
-```powershell
-python -m pipeline process-comments-queue --limit 100 --rps 1
-```
-
-Exportar dados de um dia:
-
-```powershell
-python -m pipeline export --date 2026-07-23
-```
-
-## Banco e migrations
-
-O schema versionado inicial fica em `migrations/001_init.sql`. O comando
-operacional e:
-
-```powershell
+```bash
+sudo apt install python3 python3-venv postgresql
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -e .
 python -m pipeline migrate
+python -m pipeline seed-profiles
 ```
 
-No Docker:
+No modo nativo, `POSTGRES_HOST` deve apontar para `localhost`, não para o hostname Docker `postgres`.
 
-```powershell
-docker compose run --rm app python -m pipeline migrate
-```
+## Agendamento no servidor
 
-O PostgreSQL e a fonte principal. Arquivos locais guardam midias, logs,
-relatorios e exports para auditoria fora do servidor.
-
-## Saida
-
-Responsabilidades:
-
-- `data/`: arquivos brutos e midias baixadas.
-- `logs/`: logs de execucao.
-- `reports/`: relatorios JSON diarios.
-- `exports/`: dados derivados para consulta externa.
-
-Estrutura:
-
-```text
-data/raw/posts/YYYY-MM-DD/profile/posts.ndjson
-data/raw/stories/YYYY-MM-DD/profile/
-data/raw/comments/YYYY-MM-DD/profile/shortcode.ndjson
-data/processed/posts_YYYY-MM-DD.csv
-data/processed/stories_YYYY-MM-DD.csv
-logs/YYYY-MM-DD.log
-reports/YYYY-MM-DD.json
-exports/YYYY-MM-DD/
-```
-
-O relatorio diario inclui perfis processados, status por perfil, erros, posts,
-stories, jobs enfileirados, comentarios/replies inseridos, pendencias e arquivos.
-
-## Limites da fila
-
-Configure em `.env`:
-
-```env
-MAX_COMMENTS_PER_POST=500
-JOB_LIMIT_PER_RUN=100
-COMMENT_QUEUE_TIME_LIMIT_SECONDS=1800
-MAX_JOB_ATTEMPTS=3
-```
-
-`MAX_COMMENTS_PER_POST` para a paginacao de comentarios ao atingir o limite,
-evitando que um unico post trave a coleta.
-
-## gallery-dl
-
-O runner usa `include: ["stories"]`, `archive` para evitar duplicidade e
-`sleep-request` conservador. O cookie pode vir de `cookies/collector-01.txt` ou,
-se esse arquivo nao existir, do JSON da sessao configurada.
-
-## Agendamento
-
-O comando recomendado para servidor e cron e `run-scheduled`. Ele roda a coleta
-diaria, pode exportar o dia e envia notificacao quando houver falha ou coleta
-parcial.
-
-Teste manual:
-
-```bash
-./scripts/run_daily_cron.sh
-```
-
-Ou diretamente:
-
-```bash
-docker compose run --rm app python -m pipeline run-scheduled --skip-jobs --export
-```
-
-Depois configure o cron Linux:
+O script `scripts/run_daily_cron.sh` executa `run-scheduled --skip-jobs --export`. Exemplo de crontab:
 
 ```cron
-15 8 * * * cd /srv/instascraper && ./scripts/run_daily_cron.sh >> /srv/instascraper/logs/cron-daily.log 2>&1
-*/30 * * * * cd /srv/instascraper && docker compose run --rm app python -m pipeline process-comments-queue --limit 50
-30 23 * * * cd /srv/instascraper && docker compose run --rm app python -m pipeline export --date $(date +\%F)
+15 8 * * * cd /srv/instascraper && ./scripts/run_daily_cron.sh >> logs/cron-daily.log 2>&1
 ```
 
-Para stories, considere rodar mais de uma vez ao dia, pois stories expiram.
+Antes de cadastrar:
 
-### Notificacoes
+```bash
+chmod +x scripts/run_daily_cron.sh
+./scripts/run_daily_cron.sh --date 2026-09-15
+```
 
-As notificacoes sao opcionais e configuradas por variaveis de ambiente. Por
-padrao, o projeto notifica apenas falhas ou execucoes parciais. Para notificar
-tambem sucesso, use `NOTIFY_ON_SUCCESS=true`.
+O cron executa comandos; ele não mantém sessão de terminal aberta. Caminhos devem ser absolutos e o usuário do cron precisa ter acesso ao Docker, aos cookies e à pasta de exports.
 
-Telegram recomendado para operar pelo celular:
+## Notificações
+
+`run-scheduled` pode notificar falhas por Telegram ou SMTP. Variáveis principais:
 
 ```env
 NOTIFY_ENABLED=true
 NOTIFY_PROVIDER=telegram
 NOTIFY_ON_SUCCESS=false
-TELEGRAM_BOT_TOKEN=123456:token_do_bot
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-Email/SMTP como alternativa:
+Para SMTP, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` e `SMTP_TO`. Segredos devem permanecer apenas no `.env` do servidor.
 
-```env
-NOTIFY_ENABLED=true
-NOTIFY_PROVIDER=email
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=seu_email@gmail.com
-SMTP_PASSWORD=senha_de_app
-SMTP_FROM=seu_email@gmail.com
-SMTP_TO=destino@exemplo.com
-SMTP_USE_TLS=true
-SMTP_USE_SSL=false
-```
+## Backup e restauração
 
-Para testar o alerta sem esperar erro real:
-
-```bash
-docker compose run --rm app python -m pipeline run-scheduled --skip-jobs --export --notify
-```
-
-## Backup
-
-Backup do banco:
+Backup lógico:
 
 ```powershell
-docker compose exec postgres pg_dump -U $env:POSTGRES_USER $env:POSTGRES_DB > backup.sql
+docker compose exec -T postgres pg_dump -U collector -d instagram_collector -Fc > instagram_collector.dump
 ```
 
-Backup dos volumes de midia/export/log deve ser feito no nivel do servidor ou
-copiando os dados dos volumes Docker conforme a politica da infraestrutura.
+Restauração em banco vazio:
 
-## Cuidados
+```powershell
+docker compose cp .\instagram_collector.dump postgres:/tmp/instagram_collector.dump
+docker compose exec postgres pg_restore -U collector -d instagram_collector --clean --if-exists /tmp/instagram_collector.dump
+```
 
-- Use RPS baixo.
-- Nao versione `.env`, `sessions.json`, `cookies/` ou bancos locais.
-- Rotacao deve usar contas autorizadas e auditaveis, nao servir para burlar bloqueios.
-- Logs nao devem expor cookies, tokens ou senhas.
-- Registre a finalidade academica, o periodo coletado e as contas institucionais usadas.
+O dump não inclui `exports/`, mídias, cookies nem logs. Esses diretórios exigem backup separado.
+
+## Diagnóstico
+
+### Banco indisponível
+
+```powershell
+docker compose ps
+docker compose logs postgres
+docker compose exec postgres pg_isready -U collector -d instagram_collector
+```
+
+### Worker sem processar
+
+```powershell
+docker compose logs --tail 100 media-worker
+docker compose up -d --force-recreate media-worker
+```
+
+### Respostas 401, 403 ou redirect
+
+Verifique validade dos cookies, correspondência entre JSON e Netscape, caminho montado no container e estado da conta. O navegador não precisa permanecer aberto depois que os cookies foram exportados, mas logout, troca de senha e desafios podem invalidá-los.
+
+### Resposta 429
+
+Reduza `RPS`, aumente os intervalos do `gallery-dl`, suspenda processos concorrentes e aguarde antes de repetir. O coletor de posts e o worker fazem tráfego independente.
+
+### URLs de mídia expiradas
+
+Use `refresh-failed-media` para renovar apenas posts com mídia falhada ou em retry no intervalo desejado e depois deixe o worker processar a fila novamente.
+
+## Atualização do projeto
+
+```bash
+git pull
+docker compose build app media-worker
+docker compose run --rm app python -m pipeline migrate
+docker compose up -d --force-recreate app media-worker
+```
+
+Execute `migrate` após atualizar o código; o comando é idempotente. Não substitua `.env`, `profiles.json`, `sessions.json` ou `cookies/` pelos arquivos de exemplo.

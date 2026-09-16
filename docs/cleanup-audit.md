@@ -1,5 +1,17 @@
 # Revisao de limpeza - 2026-09-06
 
+> Registro historico. Este documento preserva as evidencias e limitacoes da
+> revisao realizada naquela data; nao representa o estado atual completo do
+> projeto. A documentacao vigente esta no README, em `docs/pipeline.md` e em
+> `docs/cli.md`.
+
+## Estado posterior
+
+- O tratamento de caminhos SQLite absolutos em Linux foi corrigido.
+- A suite passou a cobrir coleta GraphQL/REST, modo incremental, atualizacao de
+  metricas e filas de midia.
+- A validacao integral mais recente executou 126 testes com sucesso em Docker.
+
 Revisao realizada sobre o commit `c680ebb`, preservando a arquitetura de CLI,
 orquestracao, adaptadores de coleta, workers e persistencia PostgreSQL/SQLite.
 Foram examinados os arquivos versionados, documentacao, manifestos, scripts,
@@ -60,5 +72,6 @@ no repositorio nem nos diretorios ancestrais aplicaveis.
   banco de producao. Integracoes autenticadas e PostgreSQL nao foram testados
   de ponta a ponta nesta limpeza.
 
-Pendencias separadas: corrigir os caminhos SQLite absolutos em Linux e definir
-explicitamente a API exportada pelo scraper antes de retirar seus simbolos.
+Pendencias registradas naquela data: corrigir os caminhos SQLite absolutos em
+Linux e definir explicitamente a API exportada pelo scraper antes de retirar
+seus simbolos. A primeira foi resolvida posteriormente, conforme a nota inicial.
