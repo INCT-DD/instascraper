@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
@@ -47,6 +47,7 @@ class InstagramCollector:
         username: str,
         date_from: datetime,
         date_to: datetime,
+        stop_post_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not self.client:
             raise RuntimeError("InstagramCollector must be used as an async context manager.")
@@ -56,6 +57,7 @@ class InstagramCollector:
         after = None
         ts_from = int(date_from.timestamp())
         ts_to = int(date_to.timestamp())
+        known_ids = stop_post_ids or set()
 
         while True:
             await self.limiter.wait()
@@ -67,20 +69,29 @@ class InstagramCollector:
                 after,
             )
 
-            page_timestamps = [
-                node.get("taken_at") or node.get("taken_at_timestamp", 0)
-                for node in posts_raw
-            ]
+            regular_timestamps = []
+            reached_known_post = False
 
             for node in posts_raw:
+                identity = str(node.get("id") or node.get("pk") or "")
+                pinned = bool(
+                    node.get("timeline_pinned_user_ids") or node.get("clips_tab_pinned_user_ids")
+                )
                 taken_at = node.get("taken_at") or node.get("taken_at_timestamp", 0)
+                if not pinned:
+                    regular_timestamps.append(taken_at)
+                if identity in known_ids and not pinned:
+                    reached_known_post = True
+                    continue
+                if identity in known_ids:
+                    continue
                 if taken_at > ts_to:
                     continue
                 if taken_at < ts_from:
                     continue
                 collected_posts.append(parse_post_metadata(node))
 
-            if page_timestamps and max(page_timestamps) < ts_from:
+            if reached_known_post or (regular_timestamps and max(regular_timestamps) < ts_from):
                 break
             if not has_next or not after:
                 break

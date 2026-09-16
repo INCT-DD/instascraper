@@ -9,11 +9,11 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import httpx
 
-from instagram_scraper import CollectionBlockedError, ProfileAccessError, RateLimitError, RateLimiter, ScrapeError, _first_int, _normalize_v1_item, parse_post_metadata
+from instagram_scraper import CollectionBlockedError, ProfileAccessError, RateLimitError, RateLimiter, ScrapeError, _normalize_v1_item, extract_post_metrics, parse_post_metadata
 
 from .config import Settings
 from .gallerydl import GalleryDlStoryCollector
@@ -26,16 +26,20 @@ def normalize_gallery_post(raw: Dict[str, Any], version: str) -> Dict[str, Any]:
     if not (raw.get("pk") or raw.get("id")) or not raw.get("code") or not raw.get("taken_at"):
         raise ScrapeError("gallery-dl returned a post without identity or publication date.")
     post = parse_post_metadata(_normalize_v1_item(raw))
-    post["likes"] = _first_int(raw.get("like_count"))
-    post["comments_count"] = _first_int(raw.get("comment_count"))
-    post["views"] = _first_int(raw.get("play_count"), raw.get("view_count"))
+    post.update(extract_post_metrics(raw))
     post["collection_source"] = "gallery-dl"
     post["raw_json"] = {**raw, "_collector": {"backend": "gallery-dl", "version": version, "api": "rest"}}
     return post
 
 
-def posts_in_window(posts: Iterable[Dict[str, Any]], start: int, end: int) -> Iterable[Dict[str, Any]]:
+def posts_in_window(
+    posts: Iterable[Dict[str, Any]],
+    start: int,
+    end: int,
+    stop_post_ids: Optional[Set[str]] = None,
+) -> Iterable[Dict[str, Any]]:
     seen = set()
+    known_ids = stop_post_ids or set()
     older_count = 0
     # A full feed page of older, unpinned posts ends the chronological scan.
     for raw in posts:
@@ -54,6 +58,10 @@ def posts_in_window(posts: Iterable[Dict[str, Any]], start: int, end: int) -> It
         identity = str(raw.get("pk") or raw.get("id") or "")
         if not identity or not raw.get("code"):
             raise ScrapeError("gallery-dl returned a post without identity.")
+        if identity in known_ids and not (
+            raw.get("timeline_pinned_user_ids") or raw.get("clips_tab_pinned_user_ids")
+        ):
+            break
         if identity not in seen:
             seen.add(identity)
             yield raw
@@ -79,7 +87,14 @@ def _extract_raw_posts(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         ex.initialize()
         ex.login()
-        posts = list(posts_in_window(ex.posts(), request["start"], request["end"]))
+        user = ex.api.user(username)
+        user_id = str(user.get("pk") or user.get("id") or "")
+        if not user_id:
+            raise ScrapeError(f"gallery-dl did not resolve @{username} to a numeric ID.")
+        raw_posts = ex.api._pagination(f"/v1/feed/user/{user_id}/", {"count": 12})
+        posts = list(posts_in_window(
+            raw_posts, request["start"], request["end"], set(request.get("stop_post_ids") or []),
+        ))
         return {"posts": posts, "version": version.__version__}
     finally:
         if ex.session is not None:
@@ -159,6 +174,7 @@ async def fetch_gallery_posts(
     date_from: datetime,
     date_to: datetime,
     rps: float,
+    stop_post_ids: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     if not math.isfinite(rps) or rps <= 0:
         raise ValueError("RPS must be finite and greater than zero.")
@@ -171,6 +187,7 @@ async def fetch_gallery_posts(
         "rps": rps,
         "sleep_request": settings.gallery_dl_sleep_request,
         "cookies": GalleryDlStoryCollector(settings)._gallery_cookies(session),
+        "stop_post_ids": sorted(stop_post_ids or set()),
     }
     # Isolate gallery-dl's global config and synchronous HTTP client per session.
     response = await _run_gallery_request(settings, request)
@@ -206,6 +223,7 @@ async def fetch_posts_with_backend(
     date_to: datetime,
     rps: float,
     limiter: RateLimiter | None = None,
+    stop_post_ids: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     backend = settings.posts_backend
     if backend not in {"auto", "graphql", "scraper", "gallery-dl"}:
@@ -216,7 +234,7 @@ async def fetch_posts_with_backend(
             async with InstagramGraphqlPostCollector(
                 session.instagram_cookie_json, rps, settings.instagram_timeline_doc_id, limiter=limiter,
             ) as scraper:
-                return await scraper.fetch_profile_posts(username, date_from, date_to)
+                return await scraper.fetch_profile_posts(username, date_from, date_to, stop_post_ids=stop_post_ids)
         except (CollectionBlockedError, ProfileAccessError):
             raise
         except (ScrapeError, httpx.HTTPError) as exc:
@@ -227,7 +245,7 @@ async def fetch_posts_with_backend(
     if backend != "gallery-dl":
         try:
             async with InstagramCollector(session.instagram_cookie_json, rps, limiter=limiter) as scraper:
-                return await scraper.fetch_profile_posts(username, date_from, date_to)
+                return await scraper.fetch_profile_posts(username, date_from, date_to, stop_post_ids=stop_post_ids)
         except CollectionBlockedError:
             raise
         except (ScrapeError, httpx.HTTPError) as exc:
@@ -235,13 +253,17 @@ async def fetch_posts_with_backend(
                 raise
             print(f"@{username}: {type(exc).__name__} in scraper; trying gallery-dl with raw metadata.")
             try:
-                return await fetch_gallery_posts(settings, session, username, date_from, date_to, rps)
+                return await fetch_gallery_posts(
+                    settings, session, username, date_from, date_to, rps, stop_post_ids=stop_post_ids,
+                )
             except CollectionBlockedError:
                 raise
             except Exception as fallback_error:
                 detail = f"GraphQL failed: {graphql_error}; " if graphql_error else ""
                 raise ScrapeError(f"{detail}Scraper failed: {exc}; fallback failed: {fallback_error}") from fallback_error
-    return await fetch_gallery_posts(settings, session, username, date_from, date_to, rps)
+    return await fetch_gallery_posts(
+        settings, session, username, date_from, date_to, rps, stop_post_ids=stop_post_ids,
+    )
 
 
 def main() -> None:

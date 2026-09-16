@@ -257,6 +257,7 @@ async def _collect_profile_posts_with_sessions(
     archive_date_from: date,
     archive_date_to: date,
     request_limiter: Optional[RateLimiter] = None,
+    new_only: bool = False,
 ) -> PostCollectionAttempt:
     last_error: Optional[Exception] = None
     errors = []
@@ -275,6 +276,7 @@ async def _collect_profile_posts_with_sessions(
                 archive_date_from=archive_date_from,
                 archive_date_to=archive_date_to,
                 request_limiter=request_limiter,
+                new_only=new_only,
             )
             return PostCollectionAttempt(stats=stats, session_alias=candidate.alias, errors=errors)
         except ProfileAccessError as exc:
@@ -413,6 +415,7 @@ async def collect_profile(
     archive_date_from: Optional[date] = None,
     archive_date_to: Optional[date] = None,
     request_limiter: Optional[RateLimiter] = None,
+    new_only: bool = False,
 ) -> ProfileCollectionStats:
     profile = db.get_profile_by_username(username)
     if not profile:
@@ -426,9 +429,11 @@ async def collect_profile(
 
     try:
         collector_session = session or CollectorSession("default", cookie_path, "")
+        stop_post_ids = set(db.list_recent_post_identities(profile["id"])) if new_only else None
         posts = await fetch_posts_with_backend(
             settings, collector_session, username, date_from, date_to,
             rps if rps is not None else settings.rps, limiter=request_limiter,
+            stop_post_ids=stop_post_ids,
         )
 
         export_date_from = archive_date_from or date_from.date()
@@ -538,6 +543,7 @@ async def run_daily_collection(
     collect_posts_enabled: bool = True,
     collect_stories_enabled: bool = True,
     retry_incomplete: bool = False,
+    new_only: bool = False,
 ) -> Dict[str, Any]:
     started_at = datetime.now(tz=timezone.utc)
     ensure_runtime_dirs(settings.data_dir, settings.logs_dir, settings.reports_dir, settings.exports_dir)
@@ -579,6 +585,7 @@ async def run_daily_collection(
                     archive_date_from=target_date,
                     archive_date_to=target_date,
                     request_limiter=request_limiter,
+                    new_only=new_only,
                 )
                 profile_result["errors"].extend(attempt.errors)
                 if attempt.session_alias:
@@ -630,6 +637,7 @@ async def collect_posts_period(
     rps: Optional[float] = None,
     resume: bool = False,
     retry_failed: bool = False,
+    new_only: bool = False,
 ) -> List[Dict[str, Any]]:
     if resume and retry_failed:
         raise ValueError("Use either resume or retry_failed, not both.")
@@ -660,6 +668,7 @@ async def collect_posts_period(
             archive_date_from=date_from.date(),
             archive_date_to=date_to.date(),
             request_limiter=request_limiter,
+            new_only=new_only,
         )
         if attempt.stats is None:
             results.append(

@@ -16,6 +16,7 @@ from .media_jobs import JOB_TYPE_STORIES, MediaJobProcessor
 from .media_refresh import refresh_failed_post_media
 from .notifications import build_crash_report, report_has_failure, send_report_notification
 from .pipeline import collect_posts_period, export_collected_day, explicit_window, run_daily_collection, seed_profiles
+from .post_metrics import refresh_existing_post_metrics
 from .sessions import SessionPool
 from .storage import Database
 
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     daily.add_argument("--stories-only", action="store_true", help="Skip post collection.")
     daily.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
+    daily.add_argument("--new-only", action="store_true", help="Stop each profile after reaching posts already stored.")
 
     scheduled = sub.add_parser("run-scheduled", help="Run daily collection, export optionally, and notify on failures.")
     scheduled.add_argument("--date", dest="target_date", help="Target date in YYYY-MM-DD. Defaults to today.")
@@ -77,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduled.add_argument("--posts-only", action="store_true", help="Skip story collection.")
     scheduled.add_argument("--stories-only", action="store_true", help="Skip post collection.")
     scheduled.add_argument("--retry-incomplete", action="store_true", help="Collect only profiles not completed for the target date.")
+    scheduled.add_argument("--new-only", action="store_true", help="Stop each profile after reaching posts already stored.")
     scheduled.add_argument("--export", action="store_true", help="Export collected day after the run.")
     scheduled.add_argument("--notify", action="store_true", help="Send notification even if NOTIFY_ENABLED=false.")
     scheduled.add_argument("--no-notify", action="store_true", help="Disable notification for this run.")
@@ -99,12 +102,23 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_media.add_argument("--end-date", required=True)
     refresh_media.add_argument("--limit", type=int, default=None, help="Maximum number of affected posts to refresh.")
 
+    refresh_metrics = sub.add_parser(
+        "refresh-post-metrics",
+        help="Refresh counters for posts already stored using Instagram media info.",
+    )
+    refresh_metrics.add_argument("--start-date", required=True)
+    refresh_metrics.add_argument("--end-date", required=True)
+    refresh_metrics.add_argument("--username")
+    refresh_metrics.add_argument("--limit", type=int, default=None)
+    refresh_metrics.add_argument("--rps", type=_positive_rps, default=None)
+
     posts = sub.add_parser("collect-posts", help="Collect posts for a date range.")
     posts.add_argument("--start-date", required=True)
     posts.add_argument("--end-date", required=True)
     posts.add_argument("--username")
     posts.add_argument("--no-comments", action="store_true", help="Do not enqueue comment jobs.")
     posts.add_argument("--rps", type=_positive_rps, default=None)
+    posts.add_argument("--new-only", action="store_true", help="Stop each profile after reaching posts already stored.")
     retry = posts.add_mutually_exclusive_group()
     retry.add_argument("--resume", action="store_true", help="Retry incomplete profiles for the exact date range, skipping latest successful attempts.")
     retry.add_argument("--retry-failed", action="store_true", help="Retry only profiles whose latest attempt failed for the exact date range.")
@@ -119,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--to", dest="date_to", required=True)
     profile.add_argument("--comments", action="store_true", help="Enqueue and process comment jobs after posts.")
     profile.add_argument("--rps", type=_positive_rps, default=None)
+    profile.add_argument("--new-only", action="store_true", help="Stop after reaching posts already stored.")
 
     export = sub.add_parser("export", help="Create a copyable export folder for a run date.")
     export.add_argument("--date", dest="target_date", required=True)
@@ -212,6 +227,7 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
                 collect_posts_enabled=collect_posts_enabled,
                 collect_stories_enabled=collect_stories_enabled,
                 retry_incomplete=args.retry_incomplete,
+                new_only=args.new_only,
             )
             print(
                 f"Daily run done: {report['posts_found']} posts, {report['stories_found']} story files, "
@@ -232,6 +248,7 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
                 collect_posts_enabled=collect_posts_enabled,
                 collect_stories_enabled=collect_stories_enabled,
                 retry_incomplete=args.retry_incomplete,
+                new_only=args.new_only,
             )
             if args.export:
                 export_path = export_collected_day(db, settings, target_date)
@@ -300,6 +317,29 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
             )
             return int(stats.posts_failed > 0)
 
+        if args.command == "refresh-post-metrics":
+            start_date = date.fromisoformat(args.start_date)
+            end_date = date.fromisoformat(args.end_date)
+            if end_date < start_date:
+                raise ValueError("--end-date must not precede --start-date.")
+            if args.limit is not None and args.limit <= 0:
+                raise ValueError("--limit must be greater than zero.")
+            stats = await refresh_existing_post_metrics(
+                db,
+                settings,
+                start_date.isoformat(),
+                (end_date + timedelta(days=1)).isoformat(),
+                username=args.username,
+                limit=args.limit,
+                rps=args.rps,
+            )
+            print(
+                f"Metric refresh finished: {stats.posts_found} posts; {stats.posts_updated} updated; "
+                f"{stats.posts_unchanged} unchanged; {stats.views_available} with views; "
+                f"{stats.reposts_available} with reposts; {stats.posts_failed} failures."
+            )
+            return int(stats.posts_failed > 0)
+
         if args.command == "collect-posts":
             date_from, date_to = explicit_window(
                 date.fromisoformat(args.start_date),
@@ -315,6 +355,7 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
                 rps=args.rps,
                 resume=args.resume,
                 retry_failed=args.retry_failed,
+                new_only=args.new_only,
             )
             return _post_collection_exit_code(results)
 
@@ -381,6 +422,7 @@ async def _execute_command(args: argparse.Namespace, settings: Settings, run_dat
                 username=args.username.lstrip("@"),
                 enqueue_comments=args.comments,
                 rps=args.rps,
+                new_only=args.new_only,
             )
             exit_code = _post_collection_exit_code(results)
             if args.comments and settings.collect_comments_default:

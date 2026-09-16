@@ -38,13 +38,13 @@ def page(nodes, more=False, cursor=None):
 
 
 class GraphqlTimelineTests(unittest.IsolatedAsyncioTestCase):
-    async def fetch(self, handler, start=START, end=END):
+    async def fetch(self, handler, start=START, end=END, stop_post_ids=None):
         with patch.object(graphql, "load_cookies", return_value=COOKIES):
             limiter = SimpleNamespace(wait=AsyncMock())
             collector = graphql.InstagramGraphqlPostCollector("fixture", 0.3, "12345", limiter)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             collector.client = client
-            result = await collector.fetch_profile_posts("@example", start, end)
+            result = await collector.fetch_profile_posts("@example", start, end, stop_post_ids=stop_post_ids)
         return result, limiter
 
     async def test_real_transport_paginates_with_csrf_and_preserves_dates_and_payload(self):
@@ -89,6 +89,28 @@ class GraphqlTimelineTests(unittest.IsolatedAsyncioTestCase):
         ]
         posts, _ = await self.fetch(lambda _: httpx.Response(200, json=responses.pop(0)))
         self.assertEqual(len(posts), 1)
+        self.assertEqual(responses, [])
+
+    async def test_incremental_stops_after_boundary_page_and_returns_only_new_posts(self):
+        known = {**raw_post(), "pk": "known", "code": "KNOWN"}
+        new = {**raw_post(), "pk": "new", "code": "NEW"}
+        handler = Mock(return_value=httpx.Response(200, json=page([new, known], True, "unused")))
+
+        posts, _ = await self.fetch(handler, stop_post_ids={"known"})
+
+        self.assertEqual([post["post_id"] for post in posts], ["new"])
+        self.assertEqual(handler.call_count, 1)
+
+    async def test_incremental_known_pinned_post_does_not_stop_history(self):
+        pinned = {**raw_post(), "pk": "known", "code": "KNOWN", "timeline_pinned_user_ids": [42]}
+        new = {**raw_post(), "pk": "new", "code": "NEW"}
+        responses = [page([pinned], True, "next"), page([new])]
+
+        posts, _ = await self.fetch(
+            lambda _: httpx.Response(200, json=responses.pop(0)), stop_post_ids={"known"},
+        )
+
+        self.assertEqual([post["post_id"] for post in posts], ["new"])
         self.assertEqual(responses, [])
 
     async def test_empty_connection_is_valid(self):
@@ -154,6 +176,15 @@ class GraphqlTimelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post["media_type"], "carousel")
         self.assertEqual(raw, original)
         self.assertEqual(post["raw_json"]["carousel_media"], raw["carousel_media"])
+
+    def test_ig_play_count_is_used_when_timeline_play_count_is_missing(self):
+        raw = raw_post(2)
+        raw.pop("play_count", None)
+        raw.update(ig_play_count=321, media_repost_count=7)
+
+        post = graphql.normalize_graphql_post(raw, "12345")
+
+        self.assertEqual((post["views"], post["reposts"]), (321, 7))
 
     def test_rest_csrf_uses_cookie_parser(self):
         headers = build_headers("https://www.instagram.com/", 'sessionid=fixture; csrftoken="token=123"; mid=fixture')

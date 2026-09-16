@@ -38,6 +38,17 @@ def settings():
 
 
 class GalleryNormalizationTests(unittest.TestCase):
+    def test_incremental_window_stops_at_known_regular_post(self):
+        new = {**raw_post(), "pk": "new", "code": "NEW"}
+        known = {**raw_post(), "pk": "known", "code": "KNOWN"}
+        older = {**raw_post(), "pk": "older", "code": "OLDER"}
+
+        posts = list(adapter.posts_in_window(
+            [new, known, older], 1, int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp()), {"known"},
+        ))
+
+        self.assertEqual([post["pk"] for post in posts], ["new"])
+
     def test_single_post_extractor_selects_exact_shortcode(self):
         extractor = Mock()
         extractor.posts.return_value = [{**raw_post(), "code": "OTHER"}, raw_post()]

@@ -416,39 +416,7 @@ def _normalize_v1_item(item: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(cap, str):
         caption_text = cap
 
-    # Likes
-    likes = item.get("like_count", 0)
-
-    # Comments
-    comments_count = item.get("comment_count", 0)
-
-    # Views
-    views = item.get("play_count") or item.get("view_count")
-
-    # Instagram may omit this metric depending on media type/account/session.
-    clips_metadata = item.get("clips_metadata") if isinstance(item.get("clips_metadata"), dict) else {}
-    reposts = _first_int(
-        item.get("media_repost_count"),
-        item.get("media_reposts_count"),
-        item.get("share_count"),
-        item.get("shares_count"),
-        item.get("reshare_count"),
-        item.get("reshares_count"),
-        item.get("repost_count"),
-        item.get("reposts_count"),
-        item.get("ig_repost_count"),
-        item.get("ig_reposts_count"),
-        clips_metadata.get("share_count"),
-        clips_metadata.get("shares_count"),
-        clips_metadata.get("reshare_count"),
-        clips_metadata.get("reshares_count"),
-        clips_metadata.get("repost_count"),
-        clips_metadata.get("reposts_count"),
-        clips_metadata.get("media_repost_count"),
-        clips_metadata.get("media_reposts_count"),
-        clips_metadata.get("ig_repost_count"),
-        clips_metadata.get("ig_reposts_count"),
-    )
+    metrics = extract_post_metrics(item)
 
     # Media type
     media_type_num = item.get("media_type", 1)
@@ -460,11 +428,11 @@ def _normalize_v1_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "media_type": media_type_num,
         "__typename": {1: "GraphImage", 2: "GraphVideo", 8: "GraphSidecar"}.get(media_type_num, "GraphImage"),
         "edge_media_to_caption": {"edges": [{"node": {"text": caption_text}}]} if caption_text else {"edges": []},
-        "edge_liked_by": {"count": likes},
-        "edge_media_to_comment": {"count": comments_count},
-        "edge_media_to_repost": {"count": reposts},
-        "reposts": reposts,
-        "video_view_count": views,
+        "edge_liked_by": {"count": metrics["likes"]},
+        "edge_media_to_comment": {"count": metrics["comments_count"]},
+        "edge_media_to_repost": {"count": metrics["reposts"]},
+        "reposts": metrics["reposts"],
+        "video_view_count": metrics["views"],
         "is_video": media_type_num == 2,
         "accessibility_caption": item.get("accessibility_caption"),
         "media_assets": _extract_media_assets(item),
@@ -569,6 +537,33 @@ def _first_int(*values: Any) -> Optional[int]:
             if normalized.isdigit():
                 return int(normalized)
     return None
+
+
+def extract_post_metrics(item: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """Extract public counters without turning omitted values into zero."""
+    clips = item.get("clips_metadata") if isinstance(item.get("clips_metadata"), dict) else {}
+    return {
+        "likes": _first_int(item.get("like_count")),
+        "comments_count": _first_int(item.get("comment_count")),
+        "views": _first_int(
+            item.get("play_count"), item.get("ig_play_count"),
+            item.get("video_view_count"), item.get("view_count"),
+            clips.get("play_count"), clips.get("ig_play_count"),
+            clips.get("video_view_count"), clips.get("view_count"),
+        ),
+        "reposts": _first_int(
+            item.get("media_repost_count"), item.get("media_reposts_count"),
+            item.get("share_count"), item.get("shares_count"),
+            item.get("reshare_count"), item.get("reshares_count"),
+            item.get("repost_count"), item.get("reposts_count"),
+            item.get("ig_repost_count"), item.get("ig_reposts_count"),
+            clips.get("share_count"), clips.get("shares_count"),
+            clips.get("reshare_count"), clips.get("reshares_count"),
+            clips.get("repost_count"), clips.get("reposts_count"),
+            clips.get("media_repost_count"), clips.get("media_reposts_count"),
+            clips.get("ig_repost_count"), clips.get("ig_reposts_count"),
+        ),
+    }
 
 
 def parse_post_metadata(node: Dict[str, Any]) -> Dict[str, Any]:

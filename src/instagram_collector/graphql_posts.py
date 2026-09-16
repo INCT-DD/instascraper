@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -15,9 +15,9 @@ from instagram_scraper import (
     RateLimitError,
     RateLimiter,
     ScrapeError,
-    _first_int,
     _normalize_v1_item,
     _raise_for_instagram_redirect,
+    extract_post_metrics,
     load_cookies,
     parse_post_metadata,
     retry_after_seconds,
@@ -36,9 +36,7 @@ def normalize_graphql_post(raw: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
     if not (raw.get("pk") or raw.get("id")) or not raw.get("code") or not raw.get("taken_at"):
         raise ScrapeError("Instagram GraphQL returned a post without identity or publication date.")
     post = parse_post_metadata(_normalize_v1_item(raw))
-    post["likes"] = _first_int(raw.get("like_count"))
-    post["comments_count"] = _first_int(raw.get("comment_count"))
-    post["views"] = _first_int(raw.get("play_count"), raw.get("view_count"))
+    post.update(extract_post_metrics(raw))
     post["collection_source"] = "instagram-graphql"
     post["raw_json"] = {
         **raw,
@@ -81,6 +79,7 @@ class InstagramGraphqlPostCollector:
         username: str,
         date_from: datetime,
         date_to: datetime,
+        stop_post_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not self.client:
             raise RuntimeError("InstagramGraphqlPostCollector must be used as an async context manager.")
@@ -95,12 +94,14 @@ class InstagramGraphqlPostCollector:
         collected: List[Dict[str, Any]] = []
         seen_posts = set()
         seen_cursors = set()
+        known_ids = stop_post_ids or set()
         after: Optional[str] = None
 
         while True:
             await self.limiter.wait()
             nodes, page_info = await self._fetch_page(username, after)
             regular_timestamps = []
+            reached_known_post = False
             for raw in nodes:
                 taken_at = raw.get("taken_at")
                 if isinstance(taken_at, bool) or not isinstance(taken_at, (int, float)) or not math.isfinite(taken_at) or taken_at <= 0:
@@ -108,15 +109,19 @@ class InstagramGraphqlPostCollector:
                 identity = str(raw.get("pk") or raw.get("id") or "")
                 if not identity or not raw.get("code"):
                     raise ScrapeError("Instagram GraphQL returned a post without identity.")
-                if not _is_pinned(raw):
+                pinned = _is_pinned(raw)
+                if not pinned:
                     regular_timestamps.append(taken_at)
+                    reached_known_post = reached_known_post or identity in known_ids
                 if taken_at < start or taken_at > end:
+                    continue
+                if identity in known_ids:
                     continue
                 if identity not in seen_posts:
                     seen_posts.add(identity)
                     collected.append(normalize_graphql_post(raw, self.doc_id))
 
-            if regular_timestamps and max(regular_timestamps) < start:
+            if reached_known_post or (regular_timestamps and max(regular_timestamps) < start):
                 break
             next_cursor = page_info.get("end_cursor")
             if not page_info["has_next_page"]:

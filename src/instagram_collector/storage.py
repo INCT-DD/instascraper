@@ -359,7 +359,11 @@ class Database:
         parsed = urlparse(database_url)
         if parsed.scheme and parsed.scheme != "sqlite":
             raise ValueError(f"Unsupported DATABASE_URL scheme: {parsed.scheme}")
-        db_path = parsed.path.lstrip("/") if parsed.scheme == "sqlite" else database_url
+        if parsed.scheme == "sqlite":
+            # Four slashes encode an absolute POSIX path; three encode a relative path.
+            db_path = parsed.path[1:] if parsed.path.startswith("//") else parsed.path.lstrip("/")
+        else:
+            db_path = database_url
         conn = sqlite3.connect(db_path or "collector.db")
         conn.row_factory = sqlite3.Row
         return conn
@@ -692,6 +696,68 @@ class Database:
 
     def get_post(self, post_id: int) -> Optional[Dict[str, Any]]:
         return self._fetchone(f"SELECT * FROM posts WHERE id = {self.placeholder}", (post_id,))
+
+    def list_recent_post_identities(self, profile_id: int, limit: int = 100) -> List[str]:
+        rows = self._fetchall(
+            (
+                f"SELECT platform_post_id FROM posts WHERE profile_id = {self.placeholder} "
+                f"ORDER BY taken_at DESC, id DESC LIMIT {self.placeholder}"
+            ),
+            (profile_id, limit),
+        )
+        return [str(row["platform_post_id"]) for row in rows if row.get("platform_post_id")]
+
+    def list_posts_for_metric_refresh(
+        self,
+        date_from: str,
+        date_to: str,
+        username: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT p.id, p.profile_id, p.platform_post_id, p.shortcode, p.likes, "
+            "p.comments_count, p.reposts, p.views, pr.username "
+            "FROM posts p JOIN profiles pr ON pr.id = p.profile_id "
+            f"WHERE p.taken_at_iso >= {self.placeholder} AND p.taken_at_iso < {self.placeholder}"
+        )
+        params: Tuple[Any, ...] = (date_from, date_to)
+        if username:
+            sql += f" AND lower(pr.username) = lower({self.placeholder})"
+            params = (*params, username.lstrip("@"))
+        sql += " ORDER BY p.taken_at DESC, p.id DESC"
+        if limit is not None:
+            sql += f" LIMIT {self.placeholder}"
+            params = (*params, limit)
+        return self._fetchall(sql, params)
+
+    def update_post_metrics(self, post_id: int, metrics: Dict[str, Optional[int]]) -> bool:
+        existing = self.get_post(post_id)
+        if not existing:
+            return False
+        changed = any(
+            metrics.get(field) is not None and metrics.get(field) != existing.get(field)
+            for field in ("likes", "comments_count", "reposts", "views")
+        )
+        sql = (
+            "UPDATE posts SET likes = COALESCE(?, likes), comments_count = COALESCE(?, comments_count), "
+            "reposts = COALESCE(?, reposts), views = COALESCE(?, views), updated_at = ? WHERE id = ?"
+        )
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+        with closing(self.conn.cursor()) as cur:
+            cur.execute(
+                sql,
+                (
+                    metrics.get("likes"),
+                    metrics.get("comments_count"),
+                    metrics.get("reposts"),
+                    metrics.get("views"),
+                    self._now(),
+                    post_id,
+                ),
+            )
+        self.conn.commit()
+        return changed
 
     def upsert_post_media(self, post_id: int, media: Dict[str, Any]) -> Tuple[int, bool]:
         source_url = str(media.get("url") or media.get("source_url") or "")

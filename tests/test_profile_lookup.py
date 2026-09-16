@@ -110,6 +110,36 @@ class ProfileLookupTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(moments[1][1] - moments[0][1], 1 / 0.3)
         self.assertAlmostEqual(moments[2][1] - moments[1][1], 1 / 0.3)
 
+    async def test_incremental_collector_ignores_known_pinned_post_as_boundary(self) -> None:
+        limiter = SimpleNamespace(wait=AsyncMock())
+        pinned = {
+            "id": "known-pinned", "shortcode": "PINNED", "taken_at": 1788220800,
+            "timeline_pinned_user_ids": [42],
+        }
+        new_post = {"id": "new", "shortcode": "NEW", "taken_at": 1788220800}
+        known_regular = {"id": "known-regular", "shortcode": "KNOWN", "taken_at": 1788134400}
+        pages = [
+            ([pinned, new_post], True, "next"),
+            ([known_regular], True, "later"),
+        ]
+        cookies = {name: "fixture" for name in ("sessionid", "csrftoken", "mid", "ds_user_id")}
+        with patch("instagram_collector.scraper.load_cookies", return_value=cookies), patch(
+            "instagram_collector.scraper.fetch_user_id", new=AsyncMock(return_value="42"),
+        ), patch(
+            "instagram_collector.scraper.fetch_posts_page", new=AsyncMock(side_effect=pages),
+        ) as fetch_page:
+            collector = InstagramCollector("fixture", 10, limiter=limiter)
+            collector.client = AsyncMock()
+            result = await collector.fetch_profile_posts(
+                "example",
+                datetime(2026, 9, 1),
+                datetime(2026, 9, 30),
+                stop_post_ids={"known-pinned", "known-regular"},
+            )
+
+        self.assertEqual([post["post_id"] for post in result], ["new"])
+        self.assertEqual(fetch_page.await_count, 2)
+
     async def test_period_preserves_limiter_across_failed_profiles(self) -> None:
         db = Mock()
         db.list_active_profiles.return_value = [{"username": "first"}, {"username": "second"}]

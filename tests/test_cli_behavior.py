@@ -121,6 +121,29 @@ class CliBehaviorTests(unittest.TestCase):
         refresh.assert_awaited_once_with(self.db, self.settings, "2026-09-10", "2026-09-12", None)
         self.assertIn("3 media URLs", self.output.getvalue())
 
+    def test_refresh_post_metrics_uses_inclusive_range_and_filters(self) -> None:
+        stats = SimpleNamespace(
+            posts_found=2, posts_updated=1, posts_unchanged=1, posts_failed=0,
+            views_available=1, reposts_available=1,
+        )
+        with patch.object(cli, "refresh_existing_post_metrics", new=AsyncMock(return_value=stats)) as refresh:
+            cli.main([
+                "refresh-post-metrics", "--start-date", "2026-09-10", "--end-date", "2026-09-11",
+                "--username", "example", "--limit", "20", "--rps", "0.2",
+            ])
+        refresh.assert_awaited_once_with(
+            self.db, self.settings, "2026-09-10", "2026-09-12",
+            username="example", limit=20, rps=0.2,
+        )
+        self.assertIn("1 with reposts", self.output.getvalue())
+
+    def test_new_only_is_forwarded_to_post_collection(self) -> None:
+        with patch.object(cli, "collect_posts_period", new=AsyncMock(return_value=[{"status": "success"}])) as collect:
+            cli.main([
+                "collect-posts", "--start-date", "2026-09-10", "--end-date", "2026-09-11", "--new-only",
+            ])
+        self.assertTrue(collect.call_args.kwargs["new_only"])
+
     def test_profile_alias_propagates_post_and_comment_failures(self) -> None:
         self.settings_loader.return_value = replace(self.settings, collect_comments_default=True)
         processor = Mock(process_pending_jobs=AsyncMock(return_value=JobStats(failed=1)))
