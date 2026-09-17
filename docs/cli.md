@@ -86,6 +86,8 @@ docker compose run --rm app python -m pipeline run-daily --date 2026-09-15 --new
 
 ## run-scheduled
 
+Para separar raspagem e downloads automaticamente, use `.\scripts\run_daily_pipeline.ps1` no Windows ou `./scripts/run_daily_cron.sh` no Linux. Os scripts param o worker antes da coleta e iniciam o serviço ao final, inclusive quando a execução fica parcial.
+
 Executa o mesmo fluxo de `run-daily`, com recursos de cron, export e notificação.
 
 ```text

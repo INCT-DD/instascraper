@@ -74,6 +74,20 @@ Esse comando coleta posts e stories. `--new-only` afeta somente posts; stories s
 
 ## Fluxos usuais
 
+### Coleta seguida pelo worker de mídia
+
+Os scripts de orquestração interrompem o worker, executam posts e stories até o fim e só então iniciam o consumo da fila:
+
+```powershell
+.\scripts\run_daily_pipeline.ps1 --date 2026-09-16 --new-only --rps 0.2
+```
+
+```bash
+./scripts/run_daily_cron.sh --date 2026-09-16 --new-only --rps 0.2
+```
+
+O worker também é iniciado quando a coleta termina parcialmente, para preservar as mídias dos perfis bem-sucedidos. O script mantém o código de saída da coleta para monitoramento e notificações.
+
 ### Posts de um período
 
 ```powershell

@@ -191,6 +191,16 @@ No modo nativo, `POSTGRES_HOST` deve apontar para `localhost`, não para o hostn
 
 ## Agendamento no servidor
 
+O agendador usa uma pipeline sequencial: interrompe o `media-worker`, conclui a raspagem de posts e stories e inicia o worker somente depois. Ele inicia o worker mesmo quando alguns perfis falham, permitindo baixar as mídias dos perfis bem-sucedidos, e preserva o código de saída da coleta para o cron.
+
+No Windows, execute:
+
+```powershell
+.\scripts\run_daily_pipeline.ps1 --date 2026-09-15 --new-only --rps 0.2
+```
+
+No Linux, use `scripts/run_daily_cron.sh`. Uma falha ao iniciar o worker tem precedência sobre o código da coleta.
+
 O script `scripts/run_daily_cron.sh` executa `run-scheduled --skip-jobs --export`. Exemplo de crontab:
 
 ```cron
